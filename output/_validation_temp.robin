@@ -1,0 +1,36 @@
+// Workflow: TakeScreenshot
+// Source: C:\Users\raksh\AppData\Local\Temp\tmpbdimtn28\extracted\REF_Testing\Framework\TakeScreenshot.xaml
+// Migrated from UiPath to Power Automate Desktop
+// Auto-declared variables referenced by migrated actions
+SET Tmp_Message_31 TO ''
+
+// Variable Declarations
+SET Screenshot TO ''
+SET ScreenshotFileInfo TO ''
+// Argument (In): in_Folder
+SET in_Folder TO ''
+// Argument (InOut): io_FilePath
+SET io_FilePath TO ''
+
+// The whole screen is captured.
+// Take screenshot
+Workstation.TakeScreenshot.TakeScreenshot
+// If no screenshot filepath
+IF $"%io_FilePath% = ''" THEN
+    // Initialize screenshot filepath
+    SET io_FilePath TO (%in_Folder% + '\' + 'ExceptionScreenshot_' + 'MANUAL_CurrentDateTime' + '.png')
+ELSE
+END
+// Initialize ScreenshotFileInfo
+SET ScreenshotFileInfo TO 'MANUAL_Object'
+// MANUAL FIX CONDITION: [Not Directory.Exists(ScreenshotFileInfo.DirectoryName)]
+// If screenshot folder does not exist, create it
+IF $"True" THEN
+    // Create directory
+    Folder.Create FolderName: '' FolderPath: VarFolderPath
+ELSE
+END
+// Save screenshot - SaveImage - PAD: pass a file path to Workstation.TakeScreenshot or save %Screenshot% via a script
+SET Tmp_Message_31 TO 'Screenshot saved at: ' + %io_FilePath%
+// Log message (Take screenshot)
+Display.ShowMessageDialog.ShowMessage Buttons: Display.Buttons.OK DefaultButton: Display.DefaultButton.Button1 Icon: Display.Icon.None IsTopMost: False Message: %Tmp_Message_31% Title: ''
