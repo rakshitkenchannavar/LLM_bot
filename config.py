@@ -6,12 +6,16 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 
 class Config:
-    """Central configuration loaded from .env file."""
+    """Central configuration loaded from .env file (AWS Bedrock)."""
 
-    # Gemini
-    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini")
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    LLM_PROVIDER = "bedrock"
+
+    # AWS Bedrock
+    AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
+    AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")
+    AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+    BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-sonnet-20240229-v1:0")
 
     # Common LLM Settings
     LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
@@ -41,11 +45,14 @@ class Config:
 
     @classmethod
     def validate(cls):
-        """Validate that required configuration is present."""
+        """Validate required configuration."""
         errors = []
 
-        if not cls.GEMINI_API_KEY:
-            errors.append("GEMINI_API_KEY is not set in .env")
+        if not cls.AWS_ACCESS_KEY_ID:
+            errors.append("AWS_ACCESS_KEY_ID is not set in .env")
+        if not cls.AWS_SECRET_ACCESS_KEY:
+            errors.append("AWS_SECRET_ACCESS_KEY is not set in .env")
+        # Session token optional (long-term IAM keys have none)
 
         if cls.TARGET_PLATFORM not in ("PAD", "AA360"):
             errors.append(f"TARGET_PLATFORM must be PAD or AA360, got: {cls.TARGET_PLATFORM}")
@@ -60,18 +67,19 @@ class Config:
 
     @classmethod
     def ensure_directories(cls):
-        """Create required output directories if they don't exist."""
         cls.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         cls.SCHEMA_DIR.mkdir(parents=True, exist_ok=True)
         cls.VALIDATOR_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def summary(cls):
-        """Return a printable config summary without exposing secrets."""
         return {
             "llm_provider": cls.LLM_PROVIDER,
-            "gemini_key_set": bool(cls.GEMINI_API_KEY),
-            "gemini_model": cls.GEMINI_MODEL,
+            "aws_region": cls.AWS_REGION,
+            "aws_key_set": bool(cls.AWS_ACCESS_KEY_ID),
+            "aws_secret_set": bool(cls.AWS_SECRET_ACCESS_KEY),
+            "aws_token_set": bool(cls.AWS_SESSION_TOKEN),
+            "bedrock_model": cls.BEDROCK_MODEL_ID,
             "max_tokens": cls.LLM_MAX_TOKENS,
             "temperature": cls.LLM_TEMPERATURE,
             "target_platform": cls.TARGET_PLATFORM,
