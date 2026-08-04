@@ -140,6 +140,34 @@ Rules:
 - Set target_action to "UNMAPPED" if no good match exists
 - Be conservative with confidence levels"""
 
+SYSTEM_ROBIN_FIX = (
+    "You are a Power Automate Desktop Robin syntax corrector. "
+    "You receive one Robin line that the official PAD parser rejected, "
+    "the parser's error, and the official RobinSyntaxTemplate for that action. "
+    "Return ONLY the corrected single line."
+)
+
+
+def robin_line_fix_prompt(line, error_message, schema_template):
+    return f"""The PAD parser rejected this Robin line:
+
+LINE: {line}
+
+PARSER ERROR: {error_message}
+
+OFFICIAL TEMPLATE FOR THIS ACTION:
+{schema_template}
+
+PROVEN VALUE RULES (follow exactly):
+- String literal: 'text'
+- Variable alone as a value: bare name (e.g. MyVar) OR $'''%MyVar%'''
+- Text built from variables: $'''text %Var% more %Var2%'''
+- IF condition: IF $"<expression>" THEN
+- Never use double quotes. Never use <<...>> placeholders.
+
+Fix ONLY the value syntax. Keep the action name and parameter names identical to the template.
+Return ONLY the corrected line, nothing else."""
+
 
 def control_flow_repair_prompt(block_type, failing_block, error_message):
     """Prompt specifically for fixing control flow block structure errors."""

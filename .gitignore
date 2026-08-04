@@ -2,7 +2,5 @@ venv/
 .env
 *.pyc
 __pycache__
-#.env
-#config.py
-#llm_client.py
+
 output

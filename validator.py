@@ -21,8 +21,9 @@ STRUCTURAL_RE = re.compile(
     r"|END(\s+EXCEPTION)?"
     r"|BEGIN\s+EXCEPTION"
     r"|ON\s+ERROR"
-    r"|LOOP(\s+WHILE\s+.+)?"
-    r"|FOR\s+EACH\s+\S+\s+IN\s+.+"
+    r"|LOOP\s+WHILE\s+.+"
+    r"|LOOP\s+FOREACH\s+\S+\s+IN\s+.+"
+    r"|LOOP"
     r"|SWITCH\s+.+"
     r"|CASE\s+.+"
     r"|DEFAULT"
@@ -32,6 +33,8 @@ STRUCTURAL_RE = re.compile(
     r"|NEXT\s+LOOP"
     r"|GOTO\s+\S+"
     r"|LABEL\s+\S+"
+    r"|ON\s+BLOCK\s+ERROR"
+    r"|BLOCK"
     r")$"
 )
 

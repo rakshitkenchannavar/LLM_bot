@@ -3,6 +3,9 @@ import re
 import logging
 from pathlib import Path
 from config import Config
+from validator import run_pad_validator
+import tempfile
+import os
 from llm_client import get_llm_client
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,7 @@ class PADScriptGenerator:
         self.generated_variables = set()
         self.script_lines = []
         self.indent_level = 0
+        self.var_grammar = "bare"
         self._load_pad_schema()
 
     def _load_pad_schema(self):
@@ -99,31 +103,57 @@ class PADScriptGenerator:
     # ------------------------------------------------------------------
 
     def generate(self, ir_data, mapping_result):
-        """Generate complete PAD Robin script from IR and mapping result."""
-        self.script_lines = []
-        self.generated_variables = set()
-        self.indent_level = 0
+        """Build the script strictly from schema templates, then let PAD's own
+        Robin parser (PADValidator.ps1) choose the variable grammar that is
+        valid on this machine. No guessing, no manual probes."""
+        mapping_lookup = {m["action_id"]: m for m in mapping_result.get("mappings", [])}
 
-        mapping_lookup = {}
-        for m in mapping_result.get("mappings", []):
-            mapping_lookup[m["action_id"]] = m
+        best_script, best_grammar = None, None
+        for grammar in ("bare", "pct", "interp"):
+            self.var_grammar = grammar
+            self.script_lines = []
+            self.generated_variables = set()
+            self.indent_level = 0
+            self._emitted = set()
 
-        if "workflows" in ir_data:
-            for idx, workflow in enumerate(ir_data["workflows"]):
-                if workflow.get("error"):
-                    self._add_comment(f"ERROR: Skipped workflow '{workflow.get('workflow_name')}' - {workflow['error']}")
-                    continue
-                if idx > 0:
-                    self._add_line("")
-                self._generate_workflow(workflow, mapping_lookup)
-        else:
-            self._generate_workflow(ir_data, mapping_lookup)
+            if "workflows" in ir_data:
+                for idx, workflow in enumerate(ir_data["workflows"]):
+                    if workflow.get("error"):
+                        self._add_comment(f"ERROR: Skipped workflow '{workflow.get('workflow_name')}' - {workflow['error']}")
+                        continue
+                    if idx > 0:
+                        self._add_line("")
+                    self._generate_workflow(workflow, mapping_lookup)
+            else:
+                self._generate_workflow(ir_data, mapping_lookup)
 
-        self._declare_missing_variables()
-        script = "\n".join(self.script_lines)
-        script = self._lint_script(script)
-        logger.info(f"Robin script generated: {len(self.script_lines)} lines")
-        return script
+            self._declare_missing_variables()
+            script = self._lint_script("\n".join(self.script_lines))
+
+            if best_script is None:
+                best_script, best_grammar = script, grammar
+
+            # Ask PAD's own parser which grammar is valid
+            tmp = os.path.join(tempfile.gettempdir(), "_grammar_probe.robin")
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(script)
+                res = run_pad_validator(tmp)
+                if res.get("pad_not_available"):
+                    logger.warning("PAD parser unavailable; keeping grammar: bare")
+                    break
+                if res.get("isValid"):
+                    best_script, best_grammar = script, grammar
+                    logger.info(f"PAD parser accepted variable grammar: {grammar}")
+                    break
+                logger.info(f"PAD parser rejected grammar '{grammar}' - trying next")
+            except Exception as e:
+                logger.warning(f"PAD parser check failed ({e}); keeping first build")
+                break
+
+        best_script = self._ensure_pasteable(best_script)
+        logger.info(f"Robin script generated with grammar: {best_grammar}")
+        return best_script
 
     def _generate_workflow(self, workflow_ir, mapping_lookup):
         """Generate Robin script for a single workflow."""
@@ -141,7 +171,7 @@ class PADScriptGenerator:
 
         for action in action_tree:
             self._generate_action(action, mapping_lookup, actions)
-
+    
     # ------------------------------------------------------------------
     # Variable declarations
     # ------------------------------------------------------------------
@@ -211,6 +241,12 @@ class PADScriptGenerator:
         action_id = action.get("action_id", "")
         action_type = action.get("action_type", "")
         display_name = action.get("display_name", "")
+
+        # Each activity node is generated at most once (kills duplicate blocks)
+        if action_id:
+            if action_id in self._emitted:
+                return
+            self._emitted.add(action_id)
 
         mapping = mapping_lookup.get(action_id)
 
@@ -314,9 +350,7 @@ class PADScriptGenerator:
     def _generate_if(self, action, mapping, mapping_lookup, all_actions):
         """Generate IF/ELSE/END block."""
         condition = self._resolve_condition(action, mapping)
-        display_name = action.get("display_name", "")
 
-        self._add_comment(f"{display_name}")
         self._add_line('IF $"' + condition + '" THEN')
         self.indent_level += 1
 
@@ -357,7 +391,7 @@ class PADScriptGenerator:
             for child in then_children:
                 self._generate_action(child, mapping_lookup, all_actions)
         else:
-            self._add_comment("No actions in Then block")
+            self._add_comment("Empty Then block")
 
         if else_children:
             self.indent_level -= 1
@@ -368,13 +402,11 @@ class PADScriptGenerator:
 
         self.indent_level -= 1
         self._add_line("END")
-
+        
     def _generate_switch(self, action, mapping, mapping_lookup, all_actions):
         """Generate SWITCH/CASE/DEFAULT/END block."""
         value = self._resolve_switch_value(action, mapping)
-        display_name = action.get("display_name", "")
 
-        self._add_comment(f"{display_name}")
         self._add_line(f"SWITCH {value}")
         self.indent_level += 1
 
@@ -407,17 +439,13 @@ class PADScriptGenerator:
         self._add_line("END")
 
     def _generate_loop(self, action, mapping, mapping_lookup, all_actions):
-        """Generate FOR EACH or LOOP WHILE block."""
+        """Generate loops using the schema's real Robin keywords."""
         target_action = mapping.get("target_action", "")
-        display_name = action.get("display_name", "")
-
-        self._add_comment(f"{display_name}")
 
         if target_action == "Loops.ForEach":
             item_var = self._resolve_param(action, mapping, "CurrentItem", "CurrentItem")
             list_var = self._resolve_param(action, mapping, "List", "ItemList")
 
-            # Fallback: read collection directly from source properties
             if list_var == "ItemList":
                 props = action.get("properties", {})
                 exprs = action.get("expressions", {})
@@ -431,8 +459,12 @@ class PADScriptGenerator:
                     if re.match(r'^[A-Za-z_]\w*$', raw):
                         list_var = raw
 
-            self._ensure_variable(item_var)
-            self._add_line(f"FOR EACH {item_var} IN {self._var_ref(list_var)}")
+            for v in (item_var, list_var):
+                if v not in self.generated_variables:
+                    self._add_line(f"SET {v} TO ''")
+                    self.generated_variables.add(v)
+
+            self._add_line(f"LOOP FOREACH {item_var} IN {self._var_ref(list_var)}")
         else:
             condition = self._resolve_condition(action, mapping)
             self._add_line(f"LOOP WHILE {condition}")
@@ -462,19 +494,23 @@ class PADScriptGenerator:
 
         self.indent_level -= 1
         self._add_line("END")
-
+        
     def _generate_try_catch(self, action, mapping, mapping_lookup, all_actions):
-        """Generate BEGIN EXCEPTION / END EXCEPTION block."""
+        """Emit PAD's proven 'On block error' grammar for UiPath TryCatch:
+
+        BLOCK
+        ON BLOCK ERROR
+        <catch actions>
+        <try actions>
+        END
+        END
+
+        Finally actions are emitted after the block.
+        """
         display_name = action.get("display_name", "")
 
-        self._add_comment(f"{display_name}")
-        self._add_line("BEGIN EXCEPTION")
-        self.indent_level += 1
-
         child_ids = action.get("child_ids", [])
-        try_children = []
-        catch_children = []
-        finally_children = []
+        try_children, catch_children, finally_children = [], [], []
 
         def _passthrough(node, bucket):
             for sub_id in node.get("child_ids", []):
@@ -489,7 +525,7 @@ class PADScriptGenerator:
                     continue
                 ct = child.get("action_type", "")
                 if ct in ("TryCatch", "RetryScope"):
-                    try_children.append(child)          # nested block stays intact
+                    try_children.append(child)
                 elif ct == "Block_Try":
                     _passthrough(child, try_children)
                 elif ct == "Block_Finally":
@@ -497,12 +533,25 @@ class PADScriptGenerator:
                 elif ct == "Catch" or ct.startswith("Catch"):
                     _passthrough(child, catch_children)
                 elif "ActivityBody" in ct or "ActivityAction" in ct or ct.startswith("Block_"):
-                    _classify(child)                     # transparent wrapper - look inside
+                    _classify(child)
                 else:
                     try_children.append(child)
 
         _classify(action)
 
+        self._add_line("BLOCK")
+        self.indent_level += 1
+        self._add_line("ON BLOCK ERROR")
+        self.indent_level += 1
+
+        # Error-handling (catch) actions first - PAD's proven order
+        if catch_children:
+            for child in catch_children:
+                self._generate_action(child, mapping_lookup, all_actions)
+        else:
+            self._add_comment("No error handling defined")
+
+        # Guarded body (try) actions second
         if try_children:
             for child in try_children:
                 self._generate_action(child, mapping_lookup, all_actions)
@@ -510,23 +559,15 @@ class PADScriptGenerator:
             self._add_comment("Empty try block")
 
         self.indent_level -= 1
-        self._add_line("ON ERROR")
-        self.indent_level += 1
-
-        if catch_children:
-            for child in catch_children:
-                self._generate_action(child, mapping_lookup, all_actions)
-        else:
-            self._add_comment("Exception caught - add error handling logic")
-
+        self._add_line("END")
         self.indent_level -= 1
-        self._add_line("END EXCEPTION")
+        self._add_line("END")
 
+        # Finally runs after the block
         if finally_children:
-            self._add_comment("Finally block (executed after try-catch)")
             for child in finally_children:
                 self._generate_action(child, mapping_lookup, all_actions)
-
+                
     def _generate_block(self, action, mapping, mapping_lookup, all_actions):
         """Generate content for structural blocks."""
         block_type = mapping.get("target_action", "BLOCK:Unknown").replace("BLOCK:", "")
@@ -573,26 +614,19 @@ class PADScriptGenerator:
         schema_entry = self.lookup_schema(target_action)
 
         if not schema_entry:
-            self._add_comment(f"{display_name}")
-            self._add_comment(f"TODO [REVIEW]: No PAD action found for '{target_action}' - manual migration required")
+            self._add_comment(f"TODO [REVIEW]: {display_name} - No PAD action found for '{target_action}' - manual migration required")
             return False
 
         template = schema_entry.get("RobinSyntaxTemplate", "")
         if not template:
-            self._add_comment(f"{display_name}")
-            self._add_comment(f"WARNING: Empty RobinSyntaxTemplate for '{target_action}'")
+            self._add_comment(f"TODO [REVIEW]: {display_name} - Empty RobinSyntaxTemplate for '{target_action}' - manual migration required")
             return False
 
         filled_line = self._fill_template(template, schema_entry, action, mapping)
 
-        annotation = action.get("annotation")
-        if annotation:
-            self._add_comment(annotation)
-
-        self._add_comment(f"{display_name}")
         self._add_line(filled_line)
         return True
-
+    
     def _generate_from_mapping_only(self, action, mapping):
         """Generate action from mapping data when no schema entry exists."""
         target_action = mapping.get("target_action", "")
@@ -612,8 +646,7 @@ class PADScriptGenerator:
         self._add_line(" ".join(parts))
 
     def _generate_set_variable(self, action, mapping):
-        """Generate SET variable assignment."""
-        display_name = action.get("display_name", "")
+        """Generate SET variable assignment in PAD's proven grammar."""
         properties = action.get("properties", {})
         expressions = action.get("expressions", {})
 
@@ -637,19 +670,16 @@ class PADScriptGenerator:
             var_name = "UnnamedVariable"
 
         value = self._translate_expression(value)
-        # Safety: a bare identifier must be a %variable% reference
         if re.fullmatch(r'[A-Za-z_]\w*', value):
             value = f"%{value}%"
-        # Safety: untranslatable .NET value -> placeholder + MANUAL FIX comment
         if self._is_untranslatable(value):
             original = properties.get("Value", "") or expressions.get("Value", "")
             self._add_comment(f"MANUAL FIX VALUE: {original}")
             value = "'MANUAL_Fix'"
         self._ensure_variable(var_name)
 
-        self._add_comment(f"{display_name}")
-        self._add_line(f"SET {var_name} TO {value}")
-
+        self._add_line(f"SET {var_name} TO {self._pad_set_value(value)}")
+        
     def _generate_wait(self, action, mapping):
         """Generate WAIT action."""
         display_name = action.get("display_name", "")
@@ -753,7 +783,7 @@ class PADScriptGenerator:
     # ------------------------------------------------------------------
 
     def _fill_template(self, template, schema_entry, action, mapping):
-        """Fill a RobinSyntaxTemplate with actual values from IR."""
+        """Fill a RobinSyntaxTemplate using PAD's proven parameter grammar."""
         inputs = schema_entry.get("Inputs", [])
         outputs = schema_entry.get("Outputs", [])
         param_mapping = mapping.get("parameter_mapping", {})
@@ -777,12 +807,30 @@ class PADScriptGenerator:
                 source_exprs=source_exprs,
                 inputs=inputs,
             )
-            # PAD named parameters accept literals or %var% only:
-            # extract inline concatenations into a temp variable
-            if isinstance(resolved_value, str) and "+" in resolved_value:
-                tmp = re.sub(r'[^A-Za-z0-9_]', '_', f"Tmp_{param_name}_{len(self.script_lines)}")
-                self._add_line(f"SET {tmp} TO {resolved_value}")
-                resolved_value = f"%{tmp}%"
+
+            if isinstance(resolved_value, str):
+                if "+" in resolved_value:
+                    tmp = re.sub(r'[^A-Za-z0-9_]', '_', f"Tmp_{param_name}_{len(self.script_lines)}")
+                    self._add_line(f"SET {tmp} TO {self._pad_set_value(resolved_value)}")
+                    resolved_value = f"$'''%{tmp}%'''"
+                else:
+                    m = re.fullmatch(r"%([A-Za-z_]\w*)%", resolved_value)
+                    if m:
+                        # Named parameters only accept literals or interpolated
+                        # strings - a bare variable was never proven to paste.
+                        resolved_value = f"$'''%{m.group(1)}%'''"
+                    elif re.fullmatch(r"Var\w+", resolved_value):
+                        if resolved_value not in self.generated_variables:
+                            self._add_line(f"SET {resolved_value} TO ''")
+                            self.generated_variables.add(resolved_value)
+                        resolved_value = f"$'''%{resolved_value}%'''"
+
+                # LLM fill for unresolved schema placeholders
+                if resolved_value.startswith("<<PLACEHOLDER"):
+                    llm_val = self._llm_fill_param(param_name, schema_entry, action)
+                    if llm_val:
+                        resolved_value = llm_val
+
             filled_parts.append(f"{param_name}: {resolved_value}")
 
         for output in outputs:
@@ -796,6 +844,22 @@ class PADScriptGenerator:
                     filled_parts.append(f"{out_name}=> {var_name}")
 
         return " ".join(filled_parts)
+    
+    def _llm_fill_param(self, param_name, schema_entry, action):
+        """Fill a schema placeholder via LLM when IR has no value for it."""
+        try:
+            client = get_llm_client()
+            result = client.infer_parameters(
+                schema_entry.get("ActionId", ""),
+                schema_entry.get("RobinSyntaxTemplate", ""),
+                action,
+            )
+            val = result.get(param_name)
+            if val and not str(val).startswith("<<"):
+                return self._format_value(str(val))
+        except Exception as e:
+            logger.debug(f"LLM param fill failed for {param_name}: {e}")
+        return None
 
     def _parse_template(self, template):
         """Parse RobinSyntaxTemplate into action name and parameter list."""
@@ -1017,6 +1081,39 @@ class PADScriptGenerator:
         expr = expr.replace('""', "''")
 
         return expr.strip() if expr.strip() else "''"
+    
+    def _pad_set_value(self, value):
+        """PAD's proven SET grammar: literals as-is; single %Var% -> bare name;
+        expressions -> $'''...''' with %x% inside."""
+        v = (value or "").strip()
+
+        m = re.fullmatch(r"%([A-Za-z_]\w*)%", v)
+        if m:
+            return m.group(1)
+
+        if "%" not in v and "+" not in v:
+            return v
+
+        parts = re.split(r"\s*\+\s*", v)
+        has_literal = any(
+            re.fullmatch(r"'[^']*'|\"[^\"]*\"", p.strip()) for p in parts
+        )
+
+        if has_literal:
+            out = []
+            for p in parts:
+                p = p.strip()
+                if re.fullmatch(r"'[^']*'|\"[^\"]*\"", p):
+                    out.append(p[1:-1])
+                elif p:
+                    out.append(p)
+            inner = re.sub(r"  +", " ", " ".join(out)).strip()
+        else:
+            inner = "+".join(p.strip() for p in parts if p.strip())
+
+        return "$'''" + inner + "'''"
+    
+    
     def _format_value(self, value):
         """Format a value for Robin script parameter."""
         if not value:
@@ -1277,13 +1374,14 @@ class PADScriptGenerator:
 
         return "1"
 
-    @staticmethod
-    def _var_ref(name):
-        """Wrap a variable name in PAD variable reference syntax."""
-        if not name:
-            return "''"
-        name = name.strip().strip("%")
-        return f"%{name}%"
+    def _var_ref(self, name):
+        """Variable reference in the grammar currently being validated."""
+        g = self.var_grammar
+        if g == "pct":
+            return f"%{name}%"
+        if g == "interp":
+            return f"$'''%{name}%'''"
+        return name
 
     def _ensure_variable(self, var_name):
         """Track a variable as generated."""
@@ -1316,8 +1414,9 @@ class PADScriptGenerator:
         r"|END(\s+EXCEPTION)?"
         r"|BEGIN\s+EXCEPTION"
         r"|ON\s+ERROR"
-        r"|LOOP(\s+WHILE\s+.+)?"
-        r"|FOR\s+EACH\s+\S+\s+IN\s+.+"
+        r"|LOOP\s+WHILE\s+.+"
+        r"|LOOP\s+FOREACH\s+\S+\s+IN\s+.+"
+        r"|LOOP"
         r"|SWITCH\s+.+"
         r"|CASE\s+.+"
         r"|DEFAULT"
@@ -1325,6 +1424,8 @@ class PADScriptGenerator:
         r"|SET\s+[A-Za-z_]\w*\s+TO\s+.+"
         r"|EXIT\s+LOOP"
         r"|NEXT\s+LOOP"
+        r"|ON\s+BLOCK\s+ERROR"
+        r"|BLOCK"
         r")$"
     )
     
@@ -1381,6 +1482,56 @@ class PADScriptGenerator:
             return True
         m = re.match(r"^([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+)", stripped)
         return bool(m and m.group(1) in self.pad_schema_index)
+    
+    def _llm_fix_line(self, line, error_msg):
+        """Ask the LLM to fix one DLL-rejected line, giving it the official
+        schema template so it corrects syntax instead of guessing."""
+        try:
+            m = re.match(r"^([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+)", line.strip())
+            template = ""
+            if m and m.group(1) in self.pad_schema_index:
+                template = self.pad_schema_index[m.group(1)].get("RobinSyntaxTemplate", "")
+            client = get_llm_client()
+            return client.suggest_robin_fix(line, error_msg, template)
+        except Exception:
+            return None
+
+    def _ensure_pasteable(self, script):
+        """Use the real PAD DLL (office laptop) to fix or neutralize any line
+        it rejects, until the script is 100% pasteable. On a laptop without
+        PAD it returns the script unchanged."""
+        for attempt in range(3):
+            tmp = os.path.join(tempfile.gettempdir(), "_paste_check.robin")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(script)
+            res = run_pad_validator(tmp)
+
+            if res.get("pad_not_available"):
+                return script
+            if res.get("isValid") or not res.get("errors"):
+                logger.info("DLL certified the script as pasteable")
+                return script
+
+            lines = script.split("\n")
+            fixed_any = False
+            for err in res.get("errors", []):
+                ln = (err.get("startLine") or err.get("stopLine") or 0) - 1
+                if not (0 <= ln < len(lines)):
+                    continue
+                original = lines[ln]
+                if original.strip().startswith("//"):
+                    continue
+                new_line = self._llm_fix_line(original, err.get("message", ""))
+                if new_line and new_line.strip() != original.strip():
+                    lines[ln] = new_line
+                    fixed_any = True
+                else:
+                    indent = original[:len(original) - len(original.lstrip())]
+                    lines[ln] = f"{indent}// [MANUAL - DLL rejected] {original.strip()}"
+            script = "\n".join(lines)
+            if not fixed_any:
+                break
+        return script
     
     # ------------------------------------------------------------------
     # Save
