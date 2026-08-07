@@ -37,6 +37,12 @@ class PADScriptGenerator:
         self.script_lines = []
         self.indent_level = 0
         self.var_grammar = "bare"
+
+        # Tracks whether generation is currently inside an ON BLOCK ERROR
+        # handler. PAD does not allow another active ON BLOCK ERROR declaration
+        # inside the same error-handler context.
+        self._error_handler_depth = 0
+
         self._load_pad_schema()
 
     def _load_pad_schema(self):
@@ -115,6 +121,7 @@ class PADScriptGenerator:
             self.generated_variables = set()
             self.indent_level = 0
             self._emitted = set()
+            self._error_handler_depth = 0
 
             if "workflows" in ir_data:
                 for idx, workflow in enumerate(ir_data["workflows"]):
@@ -495,109 +502,295 @@ class PADScriptGenerator:
         self.indent_level -= 1
         self._add_line("END")
         
-    def _generate_try_catch(self, action, mapping, mapping_lookup, all_actions):
-        """Emit PAD's proven 'On block error' grammar for UiPath TryCatch:
+    def _generate_try_catch(
+        self,
+        action,
+        mapping,
+        mapping_lookup,
+        all_actions,
+    ):
+        """Generate a UiPath TryCatch using valid PAD BLOCK grammar.
 
-        BLOCK
-        ON BLOCK ERROR
-        <catch actions>
-        <try actions>
-        END
-        END
+        Normal structure:
 
-        Finally actions are emitted after the block.
+            BLOCK
+                ON BLOCK ERROR
+                    <catch actions>
+                END
+
+                <protected try actions>
+            END
+
+            <finally actions>
+
+        PAD rejects a nested ON BLOCK ERROR while already executing an error
+        handler. If a UiPath TryCatch occurs inside a catch body, the nested
+        protected actions are emitted directly and the nested catch actions are
+        preserved inside a disabled IF block for explicit manual review.
         """
-        display_name = action.get("display_name", "")
 
-        child_ids = action.get("child_ids", [])
-        try_children, catch_children, finally_children = [], [], []
+        try_children = []
+        catch_children = []
+        finally_children = []
 
-        def _passthrough(node, bucket):
-            for sub_id in node.get("child_ids", []):
-                sub = self._get_action_by_id(sub_id, all_actions)
-                if sub:
-                    bucket.append(sub)
+        def add_children(node, destination):
+            """Append direct children of a structural wrapper."""
+            for child_id in node.get("child_ids", []):
+                child = self._get_action_by_id(child_id, all_actions)
+                if child:
+                    destination.append(child)
 
-        def _classify(node):
-            for cid in node.get("child_ids", []):
-                child = self._get_action_by_id(cid, all_actions)
+        def classify_children(node):
+            """Classify descendants into try, catch, and finally sections."""
+            for child_id in node.get("child_ids", []):
+                child = self._get_action_by_id(child_id, all_actions)
                 if not child:
                     continue
-                ct = child.get("action_type", "")
-                if ct in ("TryCatch", "RetryScope"):
-                    try_children.append(child)
-                elif ct == "Block_Try":
-                    _passthrough(child, try_children)
-                elif ct == "Block_Finally":
-                    _passthrough(child, finally_children)
-                elif ct == "Catch" or ct.startswith("Catch"):
-                    _passthrough(child, catch_children)
-                elif "ActivityBody" in ct or "ActivityAction" in ct or ct.startswith("Block_"):
-                    _classify(child)
-                else:
-                    try_children.append(child)
 
-        _classify(action)
+                child_type = child.get("action_type", "")
+                child_container = child.get("container_type", "")
 
+                if child_type == "Block_Try" or child_container == "Try":
+                    add_children(child, try_children)
+                    continue
+
+                if (
+                    child_type == "Block_Finally"
+                    or child_container == "Finally"
+                ):
+                    add_children(child, finally_children)
+                    continue
+
+                if (
+                    child_type == "Catch"
+                    or child_type.startswith("Catch<")
+                    or child_container == "Catch"
+                ):
+                    add_children(child, catch_children)
+                    continue
+
+                # Structural wrappers introduced by the XAML parser.
+                if (
+                    child_type.startswith("Block_")
+                    or child_type == "Container"
+                    or "ActivityBody" in child_type
+                    or "ActivityAction" in child_type
+                ):
+                    classify_children(child)
+                    continue
+
+                # Any direct activity not under an explicit catch/finally wrapper
+                # belongs to the protected body.
+                try_children.append(child)
+
+        classify_children(action)
+
+        # --------------------------------------------------------------
+        # Nested TryCatch inside an active PAD error handler
+        # --------------------------------------------------------------
+        if self._error_handler_depth > 0:
+            display_name = action.get("display_name", "Nested TryCatch")
+
+            self._add_comment(
+                f"MANUAL REVIEW: Nested TryCatch inside an active error "
+                f"handler: {display_name}"
+            )
+            self._add_comment(
+                "PAD cannot declare another ON BLOCK ERROR in this context."
+            )
+
+            # Emit the protected body so source actions are not silently lost.
+            if try_children:
+                self._add_comment("Nested protected body")
+                for child in try_children:
+                    self._generate_action(
+                        child,
+                        mapping_lookup,
+                        all_actions,
+                    )
+            else:
+                self._add_comment("Nested protected body is empty")
+
+            # Do not run catch actions unconditionally. Keep them in the output
+            # under an explicit disabled branch for manual migration.
+            if catch_children:
+                self._add_comment(
+                    "Nested catch actions preserved below but disabled; "
+                    "manual exception-flow migration is required"
+                )
+                self._add_line('IF $"False" THEN')
+                self.indent_level += 1
+
+                for child in catch_children:
+                    self._generate_action(
+                        child,
+                        mapping_lookup,
+                        all_actions,
+                    )
+
+                self.indent_level -= 1
+                self._add_line("END")
+
+            # Finally actions must remain executable after the protected body.
+            if finally_children:
+                self._add_comment("Nested finally actions")
+                for child in finally_children:
+                    self._generate_action(
+                        child,
+                        mapping_lookup,
+                        all_actions,
+                    )
+
+            return
+
+        # --------------------------------------------------------------
+        # Normal top-level/non-nested TryCatch
+        # --------------------------------------------------------------
         self._add_line("BLOCK")
         self.indent_level += 1
+
+        # PAD requires the error declaration to be closed before the protected
+        # body is emitted.
         self._add_line("ON BLOCK ERROR")
         self.indent_level += 1
+        self._error_handler_depth += 1
 
-        # Error-handling (catch) actions first - PAD's proven order
-        if catch_children:
-            for child in catch_children:
-                self._generate_action(child, mapping_lookup, all_actions)
-        else:
-            self._add_comment("No error handling defined")
+        try:
+            if catch_children:
+                for child in catch_children:
+                    self._generate_action(
+                        child,
+                        mapping_lookup,
+                        all_actions,
+                    )
+            else:
+                self._add_comment("No error handling defined")
+        finally:
+            self._error_handler_depth -= 1
 
-        # Guarded body (try) actions second
+        # Close ON BLOCK ERROR.
+        self.indent_level -= 1
+        self._add_line("END")
+
+        # Protected body is outside the ON BLOCK ERROR section.
         if try_children:
             for child in try_children:
-                self._generate_action(child, mapping_lookup, all_actions)
+                self._generate_action(
+                    child,
+                    mapping_lookup,
+                    all_actions,
+                )
         else:
             self._add_comment("Empty try block")
 
-        self.indent_level -= 1
-        self._add_line("END")
+        # Close BLOCK.
         self.indent_level -= 1
         self._add_line("END")
 
-        # Finally runs after the block
+        # UiPath Finally runs after either successful or handled execution.
         if finally_children:
+            self._add_comment("Finally")
             for child in finally_children:
-                self._generate_action(child, mapping_lookup, all_actions)
+                self._generate_action(
+                    child,
+                    mapping_lookup,
+                    all_actions,
+                )
                 
-    def _generate_block(self, action, mapping, mapping_lookup, all_actions):
-        """Generate content for structural blocks."""
-        block_type = mapping.get("target_action", "BLOCK:Unknown").replace("BLOCK:", "")
-        display_name = action.get("display_name", "")
+    def _generate_block(
+        self,
+        action,
+        mapping,
+        mapping_lookup,
+        all_actions,
+    ):
+        """Generate structural UiPath containers.
+
+        Structural blocks do not emit unsupported Robin actions. Their
+        children are preserved in source execution order.
+        """
+        target_action = mapping.get("target_action", "BLOCK:Unknown")
+        block_type = target_action.replace("BLOCK:", "", 1)
+        display_name = (
+            action.get("display_name")
+            or action.get("action_type")
+            or block_type
+        )
 
         if block_type == "StateMachine":
             self._add_comment(f"STATE MACHINE: {display_name}")
-            self._add_comment("NOTE: PAD has no state machine. Each STATE below is emitted with its full logic;")
-            self._add_comment("TRANSITION comments show the original conditions. Re-wire the flow manually")
-            self._add_comment("(typically as a LOOP WHILE with a State variable) when importing into PAD.")
-            self._generate_children(action, mapping_lookup, all_actions)
+            self._add_comment(
+                "NOTE: PAD has no direct state-machine equivalent."
+            )
+            self._add_comment(
+                "States and transitions are preserved below for manual "
+                "conversion to a state-variable loop."
+            )
+            self._generate_children(
+                action,
+                mapping_lookup,
+                all_actions,
+            )
             return
 
         if block_type == "State":
             self._add_line("")
-            self._add_comment(f"===== STATE: {display_name} =====")
-            self._generate_children(action, mapping_lookup, all_actions)
+            self._add_comment(
+                f"===== STATE: {display_name} ====="
+            )
+            self._generate_children(
+                action,
+                mapping_lookup,
+                all_actions,
+            )
             return
 
         if block_type == "Transition":
-            props = action.get("properties", {})
-            cond = props.get("Condition", "")
-            cond_str = self._translate_expression(cond) if cond else "always"
-            self._add_comment(f"--- TRANSITION: {display_name} | Condition: {cond_str} ---")
-            self._generate_children(action, mapping_lookup, all_actions)
+            properties = action.get("properties", {})
+            expressions = action.get("expressions", {})
+
+            condition = (
+                properties.get("Condition")
+                or expressions.get("Condition")
+                or expressions.get("expression_0")
+                or ""
+            )
+
+            if condition:
+                translated_condition = self._translate_expression(
+                    condition
+                )
+            else:
+                translated_condition = "always"
+
+            self._add_comment(
+                f"--- TRANSITION: {display_name} | "
+                f"Condition: {translated_condition} ---"
+            )
+            self._generate_children(
+                action,
+                mapping_lookup,
+                all_actions,
+            )
             return
 
-        # Default: Sequence / Flowchart / Container / Body / Action / Then / Else
-        self._generate_children(action, mapping_lookup, all_actions)
-        
+        if block_type == "FlowStep":
+            self._generate_children(
+                action,
+                mapping_lookup,
+                all_actions,
+            )
+            return
+
+        # Sequence, Flowchart, Then, Else, Body, Action, Container,
+        # Subflow and other structural wrappers are passthrough blocks.
+        self._generate_children(
+            action,
+            mapping_lookup,
+            all_actions,
+        )
+            
+            
     # ------------------------------------------------------------------
     # Standard action generators
     # ------------------------------------------------------------------
@@ -823,7 +1016,7 @@ class PADScriptGenerator:
                         if resolved_value not in self.generated_variables:
                             self._add_line(f"SET {resolved_value} TO ''")
                             self.generated_variables.add(resolved_value)
-                        resolved_value = f"$'''%{resolved_value}%'''"
+                        # Object handles stay bare (schema style: Instance: VarInstance)
 
                 # LLM fill for unresolved schema placeholders
                 if resolved_value.startswith("<<PLACEHOLDER"):
@@ -831,6 +1024,13 @@ class PADScriptGenerator:
                     if llm_val:
                         resolved_value = llm_val
 
+            # PAD designer emits text as $'''...''' - match it for non-empty strings
+            if isinstance(resolved_value, str) and len(resolved_value) >= 2 \
+                    and resolved_value.startswith("'") and resolved_value.endswith("'") \
+                    and not resolved_value.startswith("$"):
+                inner = resolved_value[1:-1]
+                if inner:
+                    resolved_value = "$'''" + inner + "'''"
             filled_parts.append(f"{param_name}: {resolved_value}")
 
         for output in outputs:
@@ -1090,6 +1290,13 @@ class PADScriptGenerator:
         m = re.fullmatch(r"%([A-Za-z_]\w*)%", v)
         if m:
             return m.group(1)
+
+        # Non-empty quoted literal -> designer-style $'''...'''
+        if len(v) >= 2 and v[0] == "'" and v[-1] == "'" and not v.startswith("$"):
+            inner = v[1:-1]
+            if inner:
+                return "$'''" + inner + "'''"
+            return v
 
         if "%" not in v and "+" not in v:
             return v
@@ -1404,7 +1611,7 @@ class PADScriptGenerator:
     def _add_comment(self, text):
         """Add a comment line to the script (official Robin comment syntax)."""
         indent = self.INDENT * self.indent_level
-        self.script_lines.append(f"{indent}// {text}")
+        self.script_lines.append(f"{indent}# {text}")
 
     
     LINT_STRUCTURAL_RE = re.compile(
@@ -1442,7 +1649,7 @@ class PADScriptGenerator:
         if not missing:
             return
 
-        block = ["// Auto-declared variables referenced by migrated actions"]
+        block = ["# Auto-declared variables referenced by migrated actions"]
         block += [f"SET {self._safe_var(v)} TO ''" for v in missing]
 
         # Insert after the header (first blank line); all SETs precede use
@@ -1473,7 +1680,7 @@ class PADScriptGenerator:
                 out.append(line)
             else:
                 indent = line[: len(line) - len(line.lstrip())]
-                out.append(f"{indent}// [AUTO-NEUTRALIZED - verify manually] {stripped}")
+                out.append(f"{indent}# [AUTO-NEUTRALIZED - verify manually] {stripped}")
                 logger.warning(f"Lint neutralized invalid line: {stripped[:80]}")
         return "\n".join(out)
 
@@ -1497,41 +1704,191 @@ class PADScriptGenerator:
             return None
 
     def _ensure_pasteable(self, script):
-        """Use the real PAD DLL (office laptop) to fix or neutralize any line
-        it rejects, until the script is 100% pasteable. On a laptop without
-        PAD it returns the script unchanged."""
-        for attempt in range(3):
-            tmp = os.path.join(tempfile.gettempdir(), "_paste_check.robin")
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(script)
-            res = run_pad_validator(tmp)
+        """Validate with the PAD parser and apply targeted safe repairs.
 
-            if res.get("pad_not_available"):
+        Non-structural failing lines may be corrected using the LLM and the
+        official schema template. Structural errors are returned unchanged
+        for block-level repair because changing one BLOCK, ON BLOCK ERROR,
+        IF, ELSE, or END line can corrupt the complete control-flow tree.
+        """
+        if not script:
+            return script or ""
+
+        max_attempts = 3
+
+        for attempt in range(max_attempts):
+            temp_path = os.path.join(
+                tempfile.gettempdir(),
+                "_paste_check.robin",
+            )
+
+            try:
+                with open(
+                    temp_path,
+                    "w",
+                    encoding="utf-8",
+                ) as file_handle:
+                    file_handle.write(script)
+
+                result = run_pad_validator(temp_path)
+
+            except Exception as exc:
+                logger.warning(
+                    "PAD pasteability check failed: %s",
+                    exc,
+                )
                 return script
-            if res.get("isValid") or not res.get("errors"):
-                logger.info("DLL certified the script as pasteable")
+
+            if result.get("pad_not_available"):
+                logger.warning(
+                    "PAD parser is unavailable. Returning the script "
+                    "without PAD DLL certification."
+                )
+                return script
+
+            if result.get("isValid"):
+                logger.info(
+                    "PAD DLL certified the script as pasteable after "
+                    "%d validation pass(es)",
+                    attempt + 1,
+                )
+                return script
+
+            errors = result.get("errors") or []
+
+            if not errors:
+                logger.warning(
+                    "PAD parser reported invalid output without errors."
+                )
                 return script
 
             lines = script.split("\n")
             fixed_any = False
-            for err in res.get("errors", []):
-                ln = (err.get("startLine") or err.get("stopLine") or 0) - 1
-                if not (0 <= ln < len(lines)):
+            structural_error_found = False
+
+            for error in errors:
+                message = str(error.get("message") or "")
+                message_lower = message.lower()
+
+                structural_markers = (
+                    "error block statement was previously defined",
+                    "block statement was previously defined",
+                    "block structure",
+                    "unexpected end",
+                    "expected end",
+                    "end of block",
+                    "missing end",
+                    "unclosed block",
+                )
+
+                if any(
+                    marker in message_lower
+                    for marker in structural_markers
+                ):
+                    structural_error_found = True
+                    logger.warning(
+                        "PAD structural error cannot safely be repaired "
+                        "one line at a time: %s",
+                        message,
+                    )
                     continue
-                original = lines[ln]
-                if original.strip().startswith("//"):
+
+                line_number = (
+                    error.get("startLine")
+                    or error.get("stopLine")
+                    or 0
+                )
+
+                try:
+                    line_number = int(line_number)
+                except (TypeError, ValueError):
+                    line_number = 0
+
+                line_index = line_number - 1
+
+                if not 0 <= line_index < len(lines):
+                    logger.warning(
+                        "PAD error has no usable line number: %s",
+                        message,
+                    )
                     continue
-                new_line = self._llm_fix_line(original, err.get("message", ""))
-                if new_line and new_line.strip() != original.strip():
-                    lines[ln] = new_line
+
+                original_line = lines[line_index]
+                stripped_line = original_line.strip()
+
+                if (
+                    not stripped_line
+                    or stripped_line.startswith("#")
+                    or stripped_line.startswith("//")
+                ):
+                    continue
+
+                corrected_line = self._llm_fix_line(
+                    original_line,
+                    message,
+                )
+
+                indent = original_line[
+                    :len(original_line) - len(original_line.lstrip())
+                ]
+
+                if (
+                    corrected_line
+                    and corrected_line.strip()
+                    and corrected_line.strip() != stripped_line
+                ):
+                    lines[line_index] = (
+                        f"{indent}{corrected_line.strip()}"
+                    )
                     fixed_any = True
+
+                    logger.info(
+                        "Applied targeted PAD correction at line %d",
+                        line_number,
+                    )
                 else:
-                    indent = original[:len(original) - len(original.lstrip())]
-                    lines[ln] = f"{indent}// [MANUAL - DLL rejected] {original.strip()}"
-            script = "\n".join(lines)
+                    # Preserve traceability. This makes the script
+                    # syntactically safer but requires manual review.
+                    lines[line_index] = (
+                        f"{indent}# [MANUAL - DLL rejected] "
+                        f"{stripped_line}"
+                    )
+                    fixed_any = True
+
+                    logger.warning(
+                        "Neutralized PAD-rejected line %d: %s",
+                        line_number,
+                        stripped_line,
+                    )
+
+            # Structural errors must be handled by RepairEngine or by fixing
+            # the corresponding generator. Do not partially alter the script.
+            if structural_error_found:
+                logger.warning(
+                    "Structural PAD validation errors remain. Returning "
+                    "the intact script for block-level repair."
+                )
+                return script
+
             if not fixed_any:
-                break
+                logger.warning(
+                    "No safe targeted PAD corrections were available."
+                )
+                return script
+
+            repaired_script = "\n".join(lines)
+
+            if repaired_script == script:
+                logger.warning(
+                    "PAD correction pass produced no script changes."
+                )
+                return script
+
+            script = repaired_script
+
+        # Always return the latest script when the retry limit is reached.
         return script
+                        
     
     # ------------------------------------------------------------------
     # Save
