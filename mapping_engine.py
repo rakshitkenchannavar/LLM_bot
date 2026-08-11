@@ -201,17 +201,128 @@ class MappingEngine:
 
         
         # Step 1: Check mapping sheet for exact match
-        mapping = self._lookup_mapping_sheet(source_type, display_name)
+        mapping = self._lookup_mapping_sheet(
+            source_type,
+            display_name,
+        )
+
         if mapping:
-            target = self.resolve_pad_action_id(mapping["target_action"])
-            logger.debug(f"Sheet match: {source_type} -> {target}")
+            normalized_source = re.sub(
+                r"[^a-z0-9]",
+                "",
+                source_type.lower(),
+            )
+
+            text_entry_source_types = {
+                "typeinto",
+                "settext",
+                "typetext",
+                "entertext",
+            }
+
+            # UiPath TypeInto/SetText must use a normal UI/web text-entry
+            # action. Do not use generic DisplayName matching because SAP
+            # contains an action with a similar display name.
+            if normalized_source in text_entry_source_types:
+                target = self._resolve_standard_text_entry_action()
+
+                if not target:
+                    target = "UNMAPPED"
+
+                parameter_mapping = dict(
+                    mapping.get("parameter_mapping", {})
+                )
+
+                if target != "UNMAPPED":
+                    schema_entry = self._get_robin_skeleton(target)
+                    schema_input_names = {
+                        str(item.get("Name") or "")
+                        for item in (
+                            schema_entry.get("Inputs", [])
+                            if schema_entry
+                            else []
+                        )
+                    }
+
+                    # Map UiPath's text property to the exact text parameter
+                    # exposed by the selected PAD action.
+                    for target_text_parameter in (
+                        "Text",
+                        "TextToWrite",
+                        "TextValue",
+                        "Value",
+                    ):
+                        if target_text_parameter in schema_input_names:
+                            parameter_mapping["Text"] = (
+                                target_text_parameter
+                            )
+                            break
+
+                notes = (
+                    mapping.get("notes", "")
+                    + " | Forced to non-SAP UI/web text-entry action."
+                ).strip(" |")
+
+            else:
+                target = self.resolve_pad_action_id(
+                    mapping["target_action"]
+                )
+                parameter_mapping = mapping.get(
+                    "parameter_mapping",
+                    {},
+                )
+                notes = mapping.get("notes", "")
+
+            # Final safety rule: a normal UiPath activity cannot become an
+            # SAP action unless the IR explicitly confirms an SAP target.
+            if target and target.lower().startswith("sap."):
+                target_app = str(
+                    ir_action.get("target_app") or ""
+                ).lower()
+
+                selector = str(
+                    ir_action.get("selector") or ""
+                ).lower()
+
+                is_confirmed_sap = (
+                    target_app == "sap"
+                    or "saplogon" in selector
+                    or "sap gui" in selector
+                    or "sap.exe" in selector
+                )
+
+                if not is_confirmed_sap:
+                    logger.warning(
+                        "Rejected SAP mapping '%s' for non-SAP source "
+                        "activity '%s'",
+                        target,
+                        source_type,
+                    )
+
+                    if normalized_source in text_entry_source_types:
+                        target = (
+                            self._resolve_standard_text_entry_action()
+                            or "UNMAPPED"
+                        )
+                    else:
+                        target = "UNMAPPED"
+
+            logger.debug(
+                "Sheet match: %s -> %s",
+                source_type,
+                target,
+            )
+
             return self._build_mapping_result(
                 ir_action=ir_action,
                 target_action=target,
-                confidence=mapping.get("confidence", "high"),
+                confidence=mapping.get(
+                    "confidence",
+                    "high",
+                ),
                 mapping_source="sheet",
-                parameter_mapping=mapping.get("parameter_mapping", {}),
-                notes=mapping.get("notes", ""),
+                parameter_mapping=parameter_mapping,
+                notes=notes,
                 robin_skeleton=self._get_robin_skeleton(target),
             )
 
@@ -634,6 +745,89 @@ class MappingEngine:
         logger.debug(f"No Robin skeleton found for: {target_action}")
         return None
 
+    def _resolve_standard_text_entry_action(self):
+        """Resolve the normal UI/web Populate Text Field action.
+
+        SAP actions are explicitly excluded. This method is used for UiPath
+        TypeInto and SetText activities unless the source is confirmed as SAP.
+        """
+
+        # First try trusted ActionIds commonly used by PAD schemas.
+        preferred_action_ids = (
+            "UIAutomation.PopulateTextField",
+            "WebAutomation.PopulateTextField",
+            "UIAutomation.PopulateTextFieldInWindow",
+            "WebAutomation.PopulateTextFieldOnWebPage",
+        )
+
+        for action_id in preferred_action_ids:
+            if action_id in self.pad_schema_index:
+                return action_id
+
+            action_lower = action_id.lower()
+            if action_lower in self._action_id_lower:
+                return self._action_id_lower[action_lower]["ActionId"]
+
+        # Fall back to schema search, but explicitly reject SAP actions.
+        candidates = []
+
+        for entry in self.pad_schema:
+            action_id = (entry.get("ActionId") or "").strip()
+            display_name = (entry.get("DisplayName") or "").strip()
+
+            if not action_id:
+                continue
+
+            action_lower = action_id.lower()
+            display_lower = display_name.lower()
+            searchable = f"{action_lower} {display_lower}"
+
+            # UiPath TypeInto for a normal browser/window must never map to SAP.
+            if action_lower.startswith("sap."):
+                continue
+
+            is_text_entry_action = (
+                "populate" in searchable
+                and "text" in searchable
+                and "field" in searchable
+            )
+
+            if not is_text_entry_action:
+                continue
+
+            # Deterministic namespace priority.
+            if action_lower.startswith("uiautomation."):
+                score = 100
+            elif action_lower.startswith("webautomation."):
+                score = 90
+            elif "window" in searchable:
+                score = 80
+            elif "web" in searchable:
+                score = 70
+            else:
+                score = 50
+
+            candidates.append((score, action_id))
+
+        if not candidates:
+            logger.error(
+                "No non-SAP Populate Text Field action was found in PAD schema"
+            )
+            return None
+
+        candidates.sort(
+            key=lambda item: (-item[0], item[1].lower())
+        )
+
+        selected_action = candidates[0][1]
+
+        logger.info(
+            "Resolved standard text-entry action to: %s",
+            selected_action,
+        )
+
+        return selected_action
+    
     # ------------------------------------------------------------------
     # Resolve PAD action from CSV mapping value
     # ------------------------------------------------------------------
@@ -662,18 +856,88 @@ class MappingEngine:
         if csv_lower in self._action_id_lower:
             return self._action_id_lower[csv_lower]["ActionId"]
 
-        # 3. Exact DisplayName match
-        for entry in self.pad_schema:
-            display = (entry.get("DisplayName") or "").lower()
-            if display and display == csv_lower:
-                return entry["ActionId"]
-
-        # 4. Curated known mappings (trusted unconditionally - synthetic
-        #    dispatcher targets like ErrorHandling.BeginException are NOT
-        #    in the DLL schema but ARE handled by the generator)
+        # 3. Curated mappings must be checked before DisplayName matching.
+        # Multiple PAD modules can expose the same DisplayName, including SAP.
         known = self._get_known_mappings()
+
         if csv_lower in known:
-            return known[csv_lower]
+            known_action = known[csv_lower]
+
+            synthetic_targets = {
+                "COMMENT",
+                "UNMAPPED",
+                "ErrorHandling.BeginException",
+            }
+
+            if (
+                known_action.startswith("BLOCK:")
+                or known_action in synthetic_targets
+            ):
+                return known_action
+
+            if known_action in self.pad_schema_index:
+                return known_action
+
+            known_lower = known_action.lower()
+
+            if known_lower in self._action_id_lower:
+                return self._action_id_lower[
+                    known_lower
+                ]["ActionId"]
+
+            # If the hardcoded ActionId differs in this schema version,
+            # dynamically resolve the normal non-SAP action.
+            if csv_lower in {
+                "type into",
+                "typeinto",
+                "set text",
+                "populate text field",
+                "populate text field in window",
+                "populate text field on window",
+            }:
+                text_action = (
+                    self._resolve_standard_text_entry_action()
+                )
+
+                if text_action:
+                    return text_action
+
+        # 4. Exact DisplayName match, only when unambiguous.
+        display_matches = []
+
+        for entry in self.pad_schema:
+            display = (
+                entry.get("DisplayName") or ""
+            ).strip().lower()
+
+            if display and display == csv_lower:
+                display_matches.append(entry)
+
+        if len(display_matches) == 1:
+            return display_matches[0]["ActionId"]
+
+        if len(display_matches) > 1:
+            non_sap_matches = [
+                entry
+                for entry in display_matches
+                if not (
+                    entry.get("ActionId", "")
+                    .lower()
+                    .startswith("sap.")
+                )
+            ]
+
+            if len(non_sap_matches) == 1:
+                return non_sap_matches[0]["ActionId"]
+
+            logger.warning(
+                "Ambiguous PAD DisplayName '%s'. Candidates: %s",
+                csv_pad_action,
+                [
+                    entry.get("ActionId", "")
+                    for entry in display_matches
+                ],
+            )
 
         # 5. Token-overlap fuzzy match
         csv_tokens = {t for t in re.split(r"[^a-z0-9]+", csv_lower) if len(t) > 2}
@@ -787,7 +1051,11 @@ class MappingEngine:
             "click": "MouseAndKeyboard.Click",
             "click ui element in window": "UIAutomation.Click",
             "type into": "UIAutomation.PopulateTextField",
+            "typeinto": "UIAutomation.PopulateTextField",
+            "set text": "UIAutomation.PopulateTextField",
+            "populate text field": "UIAutomation.PopulateTextField",
             "populate text field in window": "UIAutomation.PopulateTextField",
+            "populate text field on window": "UIAutomation.PopulateTextField",
             "get text": "UIAutomation.GetDetailsOfUiElement",
             "get details of ui element in window": "UIAutomation.GetDetailsOfUiElement",
             "send hotkey": "MouseAndKeyboard.SendKeys",
