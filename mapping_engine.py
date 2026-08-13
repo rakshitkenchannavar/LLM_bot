@@ -30,6 +30,8 @@ class MappingEngine:
         self.mapping_sheet = {}
         self.pad_schema = []
         self.pad_schema_index = {}
+        self._action_id_lower = {}
+
         self._load_mapping_sheet()
         self._load_pad_schema()
 
@@ -121,6 +123,7 @@ class MappingEngine:
             logger.error(f"Failed to load PAD schema: {e}")
             self.pad_schema = []
             self.pad_schema_index = {}
+            self._action_id_lower = {}
 
     @staticmethod
     def _difficulty_to_confidence(difficulty):
@@ -138,6 +141,110 @@ class MappingEngine:
         }
         return mapping.get(difficulty.lower(), "medium")
 
+
+    @staticmethod
+    def _normalize_context_value(value):
+        """Convert context values to safe searchable text."""
+        if value is None:
+            return ""
+
+        if isinstance(value, (dict, list, tuple, set)):
+            try:
+                return json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    default=str,
+                ).lower()
+            except Exception:
+                return str(value).lower()
+
+        return str(value).lower()
+
+    def _enrich_action_context(self, action, action_index):
+        """Add inherited application context from parent activities.
+
+        UiPath TypeInto activities often keep browser information on an
+        OpenBrowser, AttachBrowser, or UseApplicationBrowser ancestor instead
+        of on the TypeInto activity itself.
+        """
+        enriched = dict(action)
+
+        context_parts = []
+        detected_apps = []
+
+        current = action
+        visited = set()
+
+        # Include current action and then walk through its ancestors.
+        for _ in range(50):
+            if not current:
+                break
+
+            current_id = current.get("action_id")
+
+            if current_id and current_id in visited:
+                break
+
+            if current_id:
+                visited.add(current_id)
+
+            context_parts.extend(
+                [
+                    self._normalize_context_value(
+                        current.get("action_type")
+                    ),
+                    self._normalize_context_value(
+                        current.get("display_name")
+                    ),
+                    self._normalize_context_value(
+                        current.get("selector")
+                    ),
+                    self._normalize_context_value(
+                        current.get("properties")
+                    ),
+                    self._normalize_context_value(
+                        current.get("expressions")
+                    ),
+                ]
+            )
+
+            target_app = self._normalize_context_value(
+                current.get("target_app")
+            )
+
+            if target_app and target_app not in (
+                "unknownapp",
+                "unknown",
+                "none",
+            ):
+                detected_apps.append(target_app)
+
+            parent_id = current.get("parent_id")
+
+            if not parent_id:
+                break
+
+            current = action_index.get(parent_id)
+
+        enriched["_inherited_context"] = " ".join(
+            part for part in context_parts if part
+        )
+
+        enriched["_inherited_target_apps"] = detected_apps
+
+        # Preserve the closest useful inherited target application.
+        own_target_app = self._normalize_context_value(
+            action.get("target_app")
+        )
+
+        if (
+            own_target_app in ("", "unknown", "unknownapp", "none")
+            and detected_apps
+        ):
+            enriched["target_app"] = detected_apps[0]
+
+        return enriched
+    
     # ------------------------------------------------------------------
     # Main mapping interface
     # ------------------------------------------------------------------
@@ -207,10 +314,17 @@ class MappingEngine:
         )
 
         if mapping:
+            source_base_type = (
+                source_type
+                .split("<", 1)[0]
+                .split("(", 1)[0]
+                .strip()
+            )
+
             normalized_source = re.sub(
                 r"[^a-z0-9]",
                 "",
-                source_type.lower(),
+                source_base_type.lower(),
             )
 
             text_entry_source_types = {
@@ -355,45 +469,61 @@ class MappingEngine:
         )
 
     def map_all_actions(self, ir_data):
-        """Map all actions from an IR JSON.
+        """Map all IR actions with inherited application context."""
+        all_mappings = []
 
-        Args:
-            ir_data: Full IR JSON dict (single workflow or combined)
-
-        Returns:
-            dict: {mappings, summary, unmapped}
-        """
-        # Handle combined IR (multiple workflows)
         if "workflows" in ir_data:
-            all_mappings = []
-            for workflow in ir_data["workflows"]:
-                actions = workflow.get("actions", [])
-                for action in actions:
-                    mapping = self.map_action(action)
-                    mapping["workflow_name"] = workflow.get("workflow_name", "")
-                    all_mappings.append(mapping)
+            workflows = ir_data.get("workflows", [])
         else:
-            actions = ir_data.get("actions", [])
-            all_mappings = []
+            workflows = [ir_data]
+
+        for workflow in workflows:
+            actions = workflow.get("actions", [])
+
+            action_index = {
+                action.get("action_id"): action
+                for action in actions
+                if action.get("action_id")
+            }
+
             for action in actions:
-                mapping = self.map_action(action)
-                mapping["workflow_name"] = ir_data.get("workflow_name", "")
+                contextual_action = self._enrich_action_context(
+                    action,
+                    action_index,
+                )
+
+                mapping = self.map_action(
+                    contextual_action
+                )
+
+                mapping["workflow_name"] = workflow.get(
+                    "workflow_name",
+                    "",
+                )
+
                 all_mappings.append(mapping)
 
-        summary = self._build_mapping_summary(all_mappings)
+        summary = self._build_mapping_summary(
+            all_mappings
+        )
 
         result = {
             "mappings": all_mappings,
             "summary": summary,
-            "unmapped": summary.get("unmapped_actions", []),
+            "unmapped": summary.get(
+                "unmapped_actions",
+                [],
+            ),
         }
 
         logger.info(
-            f"Mapping complete: {summary['total']} actions, "
-            f"{summary['high_confidence']} high, "
-            f"{summary['medium_confidence']} medium, "
-            f"{summary['low_confidence']} low, "
-            f"{summary['unmapped_count']} unmapped"
+            "Mapping complete: %s actions, %s high, %s medium, "
+            "%s low, %s unmapped",
+            summary["total"],
+            summary["high_confidence"],
+            summary["medium_confidence"],
+            summary["low_confidence"],
+            summary["unmapped_count"],
         )
 
         return result
@@ -743,7 +873,7 @@ class MappingEngine:
 
     @staticmethod
     def _is_confirmed_sap_target(ir_action):
-        """Return True only when the source clearly targets SAP GUI."""
+        """Return True only when current or inherited context confirms SAP."""
         target_app = str(
             ir_action.get("target_app") or ""
         ).lower()
@@ -752,105 +882,132 @@ class MappingEngine:
             ir_action.get("selector") or ""
         ).lower()
 
-        properties = ir_action.get("properties", {}) or {}
-        property_text = " ".join(
-            str(value)
-            for value in properties.values()
-            if value is not None
+        properties = json.dumps(
+            ir_action.get("properties", {}) or {},
+            ensure_ascii=False,
+            default=str,
         ).lower()
+
+        inherited_context = str(
+            ir_action.get("_inherited_context") or ""
+        ).lower()
+
+        searchable = " ".join(
+            (
+                target_app,
+                selector,
+                properties,
+                inherited_context,
+            )
+        )
 
         sap_markers = (
             "saplogon",
+            "saplogon.exe",
             "sap gui",
-            "sap.exe",
             "sapgui",
             "sap session",
+            "sap scripting",
         )
 
-        return (
-            target_app == "sap"
-            or any(marker in selector for marker in sap_markers)
-            or any(marker in property_text for marker in sap_markers)
+        return any(
+            marker in searchable
+            for marker in sap_markers
         )
-
     @staticmethod
     def _is_web_target(ir_action):
-        """Detect whether a UiPath activity targets a browser/web element."""
+        """Detect browser/web targets using current and ancestor context."""
         target_app = str(
             ir_action.get("target_app") or ""
         ).lower()
+
+        inherited_apps = " ".join(
+            str(value).lower()
+            for value in ir_action.get(
+                "_inherited_target_apps",
+                [],
+            )
+        )
 
         selector = str(
             ir_action.get("selector") or ""
         ).lower()
 
-        properties = ir_action.get("properties", {}) or {}
-        property_text = " ".join(
-            f"{key}={value}"
-            for key, value in properties.items()
-            if value is not None
+        properties = json.dumps(
+            ir_action.get("properties", {}) or {},
+            ensure_ascii=False,
+            default=str,
         ).lower()
 
-        browser_apps = {
+        expressions = json.dumps(
+            ir_action.get("expressions", {}) or {},
+            ensure_ascii=False,
+            default=str,
+        ).lower()
+
+        inherited_context = str(
+            ir_action.get("_inherited_context") or ""
+        ).lower()
+
+        searchable = " ".join(
+            (
+                target_app,
+                inherited_apps,
+                selector,
+                properties,
+                expressions,
+                inherited_context,
+            )
+        )
+
+        browser_markers = (
             "chrome",
+            "chrome.exe",
+            "msedge",
+            "msedge.exe",
             "edge",
             "firefox",
-            "internetexplorer",
-            "internet explorer",
+            "firefox.exe",
             "iexplore",
-            "msedge",
+            "iexplore.exe",
+            "internet explorer",
             "browser",
-        }
-
-        web_selector_markers = (
-            "<webctrl",
+            "openbrowser",
+            "open browser",
+            "attachbrowser",
+            "attach browser",
+            "useapplicationbrowser",
+            "use application/browser",
+            "use application browser",
+            "browser scope",
             "webctrl",
-            "<html",
+            "<webctrl",
             "html",
-            "css-selector",
+            "<html",
+            "html app",
+            "<html app",
+            "css selector",
             "cssselector",
             "xpath",
-            "aaname",
-            "tag=",
-            "browser",
-            "chrome.exe",
-            "msedge.exe",
-            "firefox.exe",
-            "iexplore.exe",
-        )
-
-        web_property_markers = (
-            "browsertype",
             "browserurl",
-            "url=",
-            "webpage",
+            "browser type",
+            "browsertype",
             "web page",
-            "chrome",
-            "msedge",
-            "firefox",
-            "iexplore",
+            "webpage",
+            "title=",
+            "url=",
+            "idx=",
+            "rpachallenge.com",
+            "rpa challenge",
         )
 
-        if target_app in browser_apps:
-            return True
-
-        if any(marker in selector for marker in web_selector_markers):
-            return True
-
-        if any(marker in property_text for marker in web_property_markers):
-            return True
-
-        return False
-
+        return any(
+            marker in searchable
+            for marker in browser_markers
+        )
+    
     def _find_text_entry_schema_action(self, target_kind):
-        """Find the exact text-entry ActionId from the PAD schema.
-
-        Args:
-            target_kind: "web", "window", or "sap"
-
-        Returns:
-            Exact schema ActionId or None.
-        """
+        """Find the exact web, window, or SAP text-entry schema action."""
         candidates = []
 
         for entry in self.pad_schema:
@@ -862,165 +1019,147 @@ class MappingEngine:
                 entry.get("DisplayName") or ""
             ).strip()
 
-            if not action_id:
+            template = str(
+                entry.get("RobinSyntaxTemplate") or ""
+            ).strip()
+
+            if not action_id or not template:
                 continue
 
             action_lower = action_id.lower()
             display_lower = display_name.lower()
-            searchable = f"{action_lower} {display_lower}"
+            template_lower = template.lower()
 
-            is_populate_text_action = (
+            searchable = " ".join(
+                (
+                    action_lower,
+                    display_lower,
+                    template_lower,
+                )
+            )
+
+            if not (
                 "populate" in searchable
                 and "text" in searchable
                 and "field" in searchable
-            )
-
-            if not is_populate_text_action:
+            ):
                 continue
 
-            is_sap_action = action_lower.startswith("sap.")
+            is_sap = action_lower.startswith("sap.")
 
-            is_web_action = (
+            is_web = (
                 action_lower.startswith("webautomation.")
-                or "web page" in searchable
+                or action_lower.startswith("browserautomation.")
+                or action_lower.startswith("webform.")
+                or "on web page" in display_lower
+                or "web page" in display_lower
                 or "webpage" in searchable
-                or "browser" in searchable
+                or "web browser" in searchable
+                or "browser instance" in searchable
+                or "web browser instance" in searchable
             )
 
-            is_window_action = (
+            is_window = (
                 action_lower.startswith("uiautomation.")
-                or "in window" in searchable
-                or "on window" in searchable
-                or "window" in searchable
+                or "in window" in display_lower
+                or "on window" in display_lower
             )
-
-            score = 0
 
             if target_kind == "sap":
-                if not is_sap_action:
+                if not is_sap:
                     continue
-
-                score = 100
+                score = 300
 
             elif target_kind == "web":
-                # A browser activity must never accidentally map to SAP.
-                if is_sap_action:
+                if is_sap or not is_web:
                     continue
+
+                score = 200
 
                 if action_lower.startswith("webautomation."):
-                    score = 120
-                elif "on web page" in searchable:
-                    score = 115
-                elif "web page" in searchable:
-                    score = 110
-                elif "webpage" in searchable:
-                    score = 105
-                elif "browser" in searchable:
-                    score = 90
-                elif is_window_action:
-                    # Window UI automation is an allowed fallback only.
-                    score = 40
-                else:
-                    score = 20
+                    score += 50
+
+                if "on web page" in display_lower:
+                    score += 40
 
             elif target_kind == "window":
-                # A desktop activity must never accidentally map to SAP.
-                if is_sap_action:
+                if is_sap or not is_window:
                     continue
 
+                score = 200
+
                 if action_lower.startswith("uiautomation."):
-                    score = 120
-                elif "in window" in searchable:
-                    score = 115
-                elif "on window" in searchable:
-                    score = 110
-                elif is_window_action:
-                    score = 100
-                elif is_web_action:
-                    score = 30
-                else:
-                    score = 20
+                    score += 50
+
+                if "in window" in display_lower:
+                    score += 40
 
             else:
-                continue
+                return None
 
             candidates.append(
-                {
-                    "score": score,
-                    "action_id": action_id,
-                    "display_name": display_name,
-                }
+                (
+                    score,
+                    action_id,
+                )
             )
 
         if not candidates:
             logger.warning(
-                "No PAD text-entry schema action found for target kind: %s",
+                "No exact '%s' Populate Text Field action found in schema",
                 target_kind,
             )
             return None
 
         candidates.sort(
             key=lambda item: (
-                -item["score"],
-                item["action_id"].lower(),
+                -item[0],
+                item[1].lower(),
             )
         )
 
-        selected = candidates[0]
+        selected = candidates[0][1]
 
         logger.info(
-            "Selected %s text-entry action: %s (%s)",
+            "Selected %s text-entry action: %s",
             target_kind,
-            selected["action_id"],
-            selected["display_name"],
+            selected,
         )
 
-        return selected["action_id"]
-
+        return selected
+    
     def _resolve_text_entry_action(self, ir_action):
-        """Resolve TypeInto to SAP, web, or window text population."""
+        """Select SAP, web, or window text entry from source context."""
         if self._is_confirmed_sap_target(ir_action):
-            sap_action = self._find_text_entry_schema_action("sap")
-
-            if sap_action:
-                return sap_action
-
-            logger.warning(
-                "Source appears to target SAP, but no SAP Populate Text "
-                "Field action exists in the PAD schema."
+            return (
+                self._find_text_entry_schema_action("sap")
+                or "UNMAPPED"
             )
-            return "UNMAPPED"
 
         if self._is_web_target(ir_action):
-            web_action = self._find_text_entry_schema_action("web")
+            web_action = self._find_text_entry_schema_action(
+                "web"
+            )
 
             if web_action:
                 return web_action
 
-            # Safe fallback when the installed PAD schema has no web action.
             logger.warning(
-                "No web Populate Text Field action found. Falling back "
-                "to the non-SAP window UI Automation action."
+                "The source is a browser activity, but the PAD schema "
+                "does not contain Populate Text Field on Web Page. "
+                "Using window UI automation as a fallback."
             )
 
-            window_action = self._find_text_entry_schema_action(
-                "window"
+            return (
+                self._find_text_entry_schema_action("window")
+                or "UNMAPPED"
             )
 
-            return window_action or "UNMAPPED"
-
-        window_action = self._find_text_entry_schema_action("window")
-
-        if window_action:
-            return window_action
-
-        logger.warning(
-            "No non-SAP window Populate Text Field action exists "
-            "in the PAD schema."
+        return (
+            self._find_text_entry_schema_action("window")
+            or "UNMAPPED"
         )
-
-        return "UNMAPPED"
-
+        
     def _build_text_entry_parameter_mapping(
         self,
         target_action,
@@ -1481,18 +1620,21 @@ class MappingEngine:
             # Error handling
             "try catch": "ErrorHandling.BeginException",
             "begin error handling": "ErrorHandling.BeginException",
-            "for each row": "Loops.ForEach",
             "begin exception block": "ErrorHandling.BeginException",
             "throw": "ErrorHandling.ThrowError",
             "throw error": "ErrorHandling.ThrowError",
-            "throw": "ErrorHandling.ThrowError",
             "throw exception": "ErrorHandling.ThrowError",
-            "begin error handling": "ErrorHandling.BeginException",
+            "rethrow": "ErrorHandling.ThrowError",
+            "terminate flow": "ErrorHandling.ThrowError",
+
+            # Invoke
             "run desktop flow": "Flow.RunSubflow",
             "invoke workflow file": "Flow.RunSubflow",
-            "terminate flow": "ErrorHandling.ThrowError",
+
+            # Miscellaneous
+            "for each row": "Loops.ForEach",
             "manual review required": "COMMENT",
-            "rethrow": "ErrorHandling.ThrowError",
+            "comment": "COMMENT",
             # Invoke
             "invoke workflow file": "Flow.RunSubflow",
             # Comment
