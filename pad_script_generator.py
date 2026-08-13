@@ -42,7 +42,8 @@ class PADScriptGenerator:
         # handler. PAD does not allow another active ON BLOCK ERROR declaration
         # inside the same error-handler context.
         self._error_handler_depth = 0
-
+        # One manual-review comment per source action.
+        self._manual_review_comments = {}
         self._load_pad_schema()
 
     def _load_pad_schema(self):
@@ -122,11 +123,39 @@ class PADScriptGenerator:
             self.indent_level = 0
             self._emitted = set()
             self._error_handler_depth = 0
+            self._manual_review_comments = {}
 
             if "workflows" in ir_data:
                 for idx, workflow in enumerate(ir_data["workflows"]):
                     if workflow.get("error"):
-                        self._add_comment(f"ERROR: Skipped workflow '{workflow.get('workflow_name')}' - {workflow['error']}")
+                        self._add_manual_review(
+                            action={
+                                "action_id": (
+                                    f"workflow_error_{idx}"
+                                ),
+                                "action_type": "Workflow",
+                                "display_name": workflow.get(
+                                    "workflow_name",
+                                    "Unknown workflow",
+                                ),
+                                "properties": {},
+                                "expressions": {},
+                                "selector": None,
+                            },
+                            reason=(
+                                "The source workflow could not be "
+                                "processed"
+                            ),
+                            details=str(workflow["error"]),
+                            suggested_pad_action=(
+                                "Manual desktop-flow implementation"
+                            ),
+                            required_work=(
+                                "Open the source XAML, identify its "
+                                "activities, and migrate the workflow "
+                                "manually."
+                            ),
+                        )
                         continue
                     if idx > 0:
                         self._add_line("")
@@ -163,61 +192,83 @@ class PADScriptGenerator:
         return best_script
 
     def _generate_workflow(self, workflow_ir, mapping_lookup):
-        """Generate Robin script for a single workflow."""
-        workflow_name = workflow_ir.get("workflow_name", "Main")
-
-        self._add_comment(f"Workflow: {workflow_name}")
-        self._add_comment(f"Source: {workflow_ir.get('source_file', 'Unknown')}")
-        self._add_comment(f"Migrated from UiPath to Power Automate Desktop")
-        self._add_line("")
-
+        """Generate Robin actions for one workflow without header comments."""
         self._generate_variable_declarations(workflow_ir)
 
         actions = workflow_ir.get("actions", [])
         action_tree = self._build_action_tree(actions)
 
         for action in action_tree:
-            self._generate_action(action, mapping_lookup, actions)
-    
+            self._generate_action(
+                action,
+                mapping_lookup,
+                actions,
+            )
     # ------------------------------------------------------------------
     # Variable declarations
     # ------------------------------------------------------------------
 
     def _generate_variable_declarations(self, workflow_ir):
-        """Generate SET statements for all workflow variables."""
+        """Declare required variables without informational comments.
+
+        SET statements are retained because generated actions depend on these
+        variables. Only descriptive comments are removed.
+        """
         variables = workflow_ir.get("variables", [])
         arguments = workflow_ir.get("arguments", [])
 
-        if not variables and not arguments:
-            return
-
-        self._add_comment("Variable Declarations")
+        declarations_added = False
 
         for var in variables:
             name = var.get("name", "")
+
             if not name:
                 continue
+
             default = var.get("default_value", "")
             var_type = var.get("type", "General")
-            default_value = self._get_default_for_type(var_type, default)
-            safe = self._safe_var(name)
-            self._add_line(f"SET {safe} TO {default_value}")
-            self.generated_variables.add(safe)
+            default_value = self._get_default_for_type(
+                var_type,
+                default,
+            )
+
+            safe_name = self._safe_var(name)
+
+            self._add_line(
+                f"SET {safe_name} TO {default_value}"
+            )
+
+            self.generated_variables.add(safe_name)
+            declarations_added = True
 
         for arg in arguments:
             name = arg.get("name", "")
-            if not name or name in self.generated_variables:
+
+            if not name:
                 continue
+
+            safe_name = self._safe_var(name)
+
+            if safe_name in self.generated_variables:
+                continue
+
             default = arg.get("default_value", "")
             arg_type = arg.get("type", "General")
-            default_value = self._get_default_for_type(arg_type, default)
-            direction = arg.get("direction", "In")
-            self._add_comment(f"Argument ({direction}): {name}")
-            self._add_line(f"SET {name} TO {default_value}")
-            self.generated_variables.add(name)
 
-        self._add_line("")
+            default_value = self._get_default_for_type(
+                arg_type,
+                default,
+            )
 
+            self._add_line(
+                f"SET {safe_name} TO {default_value}"
+            )
+
+            self.generated_variables.add(safe_name)
+            declarations_added = True
+
+        if declarations_added:
+            self._add_line("")
     # ------------------------------------------------------------------
     # Action tree building
     # ------------------------------------------------------------------
@@ -258,8 +309,20 @@ class PADScriptGenerator:
         mapping = mapping_lookup.get(action_id)
 
         if not mapping:
-            self._add_comment(f"UNMAPPED: {action_type} - {display_name} (no mapping found)")
-            self._generate_children(action, mapping_lookup, all_actions)
+            self._add_manual_review(
+                action=action,
+                reason="No target mapping was found",
+                details=(
+                    "Create the corresponding PAD action manually "
+                    "and verify its parameters."
+                ),
+            )
+
+            self._generate_children(
+                action,
+                mapping_lookup,
+                all_actions,
+            )
             return
 
         target_action = mapping.get("target_action", "")
@@ -589,35 +652,41 @@ class PADScriptGenerator:
         # Nested TryCatch inside an active PAD error handler
         # --------------------------------------------------------------
         if self._error_handler_depth > 0:
-            display_name = action.get("display_name", "Nested TryCatch")
-
-            self._add_comment(
-                f"MANUAL REVIEW: Nested TryCatch inside an active error "
-                f"handler: {display_name}"
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "PAD cannot create another ON BLOCK ERROR inside the "
+                    "active error-handler section"
+                ),
+                suggested_pad_action=(
+                    "Restructured error handling or separate subflow"
+                ),
+                source_data={
+                    "TryActionCount": len(try_children),
+                    "CatchActionCount": len(catch_children),
+                    "FinallyActionCount": len(finally_children),
+                    "ExceptionHandling": action.get(
+                        "exception_handling"
+                    ),
+                },
+                required_work=(
+                    "Move the protected logic into a separate subflow or "
+                    "recreate the nested exception behavior using supported "
+                    "PAD error handling. Catch actions are currently kept "
+                    "inside a disabled False branch."
+                ),
             )
-            self._add_comment(
-                "PAD cannot declare another ON BLOCK ERROR in this context."
-            )
 
-            # Emit the protected body so source actions are not silently lost.
             if try_children:
-                self._add_comment("Nested protected body")
                 for child in try_children:
                     self._generate_action(
                         child,
                         mapping_lookup,
                         all_actions,
                     )
-            else:
-                self._add_comment("Nested protected body is empty")
 
-            # Do not run catch actions unconditionally. Keep them in the output
-            # under an explicit disabled branch for manual migration.
             if catch_children:
-                self._add_comment(
-                    "Nested catch actions preserved below but disabled; "
-                    "manual exception-flow migration is required"
-                )
                 self._add_line('IF $"False" THEN')
                 self.indent_level += 1
 
@@ -631,9 +700,7 @@ class PADScriptGenerator:
                 self.indent_level -= 1
                 self._add_line("END")
 
-            # Finally actions must remain executable after the protected body.
             if finally_children:
-                self._add_comment("Nested finally actions")
                 for child in finally_children:
                     self._generate_action(
                         child,
@@ -642,7 +709,6 @@ class PADScriptGenerator:
                     )
 
             return
-
         # --------------------------------------------------------------
         # Normal top-level/non-nested TryCatch
         # --------------------------------------------------------------
@@ -704,13 +770,18 @@ class PADScriptGenerator:
         mapping_lookup,
         all_actions,
     ):
-        """Generate structural UiPath containers.
+        """Generate structural containers and retain required manual work."""
+        target_action = mapping.get(
+            "target_action",
+            "BLOCK:Unknown",
+        )
 
-        Structural blocks do not emit unsupported Robin actions. Their
-        children are preserved in source execution order.
-        """
-        target_action = mapping.get("target_action", "BLOCK:Unknown")
-        block_type = target_action.replace("BLOCK:", "", 1)
+        block_type = target_action.replace(
+            "BLOCK:",
+            "",
+            1,
+        )
+
         display_name = (
             action.get("display_name")
             or action.get("action_type")
@@ -718,14 +789,35 @@ class PADScriptGenerator:
         )
 
         if block_type == "StateMachine":
-            self._add_comment(f"STATE MACHINE: {display_name}")
-            self._add_comment(
-                "NOTE: PAD has no direct state-machine equivalent."
+            properties = action.get("properties", {}) or {}
+
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "PAD has no direct UiPath state-machine container"
+                ),
+                suggested_pad_action=(
+                    "Loop with CurrentState variable and If/Switch branches"
+                ),
+                source_data={
+                    "InitialState": properties.get(
+                        "InitialState",
+                        "",
+                    ),
+                    "StateChildren": action.get(
+                        "child_ids",
+                        [],
+                    ),
+                },
+                required_work=(
+                    "Create a CurrentState variable, execute states inside "
+                    "a loop, and implement each transition by assigning the "
+                    "next state. Do not leave the generated states running "
+                    "sequentially."
+                ),
             )
-            self._add_comment(
-                "States and transitions are preserved below for manual "
-                "conversion to a state-variable loop."
-            )
+
             self._generate_children(
                 action,
                 mapping_lookup,
@@ -734,10 +826,29 @@ class PADScriptGenerator:
             return
 
         if block_type == "State":
-            self._add_line("")
-            self._add_comment(
-                f"===== STATE: {display_name} ====="
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "This UiPath state was flattened because PAD has no "
+                    "direct state container"
+                ),
+                suggested_pad_action=(
+                    "CurrentState If/Switch branch"
+                ),
+                source_data={
+                    "StateName": display_name,
+                    "ChildActions": action.get(
+                        "child_ids",
+                        [],
+                    ),
+                },
+                required_work=(
+                    "Move this state's generated actions into the "
+                    "corresponding CurrentState branch."
+                ),
             )
+
             self._generate_children(
                 action,
                 mapping_lookup,
@@ -746,27 +857,43 @@ class PADScriptGenerator:
             return
 
         if block_type == "Transition":
-            properties = action.get("properties", {})
-            expressions = action.get("expressions", {})
+            properties = action.get("properties", {}) or {}
+            expressions = action.get("expressions", {}) or {}
 
             condition = (
                 properties.get("Condition")
                 or expressions.get("Condition")
                 or expressions.get("expression_0")
-                or ""
+                or "Default/unconditional transition"
             )
 
-            if condition:
-                translated_condition = self._translate_expression(
-                    condition
-                )
-            else:
-                translated_condition = "always"
-
-            self._add_comment(
-                f"--- TRANSITION: {display_name} | "
-                f"Condition: {translated_condition} ---"
+            target_state = (
+                properties.get("To")
+                or properties.get("Target")
+                or properties.get("TargetState")
+                or "Determine from source XAML"
             )
+
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "UiPath state transition requires manual PAD "
+                    "state-variable routing"
+                ),
+                suggested_pad_action=(
+                    "If condition plus Set CurrentState"
+                ),
+                source_data={
+                    "Condition": condition,
+                    "TargetState": target_state,
+                },
+                required_work=(
+                    "Create the transition condition and set CurrentState "
+                    "to the target state when the condition is true."
+                ),
+            )
+
             self._generate_children(
                 action,
                 mapping_lookup,
@@ -774,16 +901,8 @@ class PADScriptGenerator:
             )
             return
 
-        if block_type == "FlowStep":
-            self._generate_children(
-                action,
-                mapping_lookup,
-                all_actions,
-            )
-            return
-
-        # Sequence, Flowchart, Then, Else, Body, Action, Container,
-        # Subflow and other structural wrappers are passthrough blocks.
+        # FlowStep, Sequence, Flowchart, Then, Else, Body, Action and
+        # ordinary structural wrappers are transparent containers.
         self._generate_children(
             action,
             mapping_lookup,
@@ -796,26 +915,130 @@ class PADScriptGenerator:
     # ------------------------------------------------------------------
 
     def _generate_standard_action(self, action, mapping):
-        """Generate a standard PAD action using schema skeleton.
+        """Generate a schema-backed action and report only required work."""
+        target_action = mapping.get(
+            "target_action",
+            "",
+        )
 
-        Returns:
-            True if a real Robin action line was emitted, False otherwise.
-        """
-        target_action = mapping.get("target_action", "")
-        display_name = action.get("display_name", "")
-
-        schema_entry = self.lookup_schema(target_action)
+        schema_entry = self.lookup_schema(
+            target_action
+        )
 
         if not schema_entry:
-            self._add_comment(f"TODO [REVIEW]: {display_name} - No PAD action found for '{target_action}' - manual migration required")
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    f"PAD schema action '{target_action}' was not found"
+                ),
+                suggested_pad_action=target_action,
+                required_work=(
+                    "Select the closest PAD action manually and configure "
+                    "its inputs, outputs, and dependencies."
+                ),
+            )
             return False
 
-        template = schema_entry.get("RobinSyntaxTemplate", "")
+        template = schema_entry.get(
+            "RobinSyntaxTemplate",
+            "",
+        )
+
         if not template:
-            self._add_comment(f"TODO [REVIEW]: {display_name} - Empty RobinSyntaxTemplate for '{target_action}' - manual migration required")
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    f"PAD schema action '{target_action}' has no Robin "
+                    "syntax template"
+                ),
+                suggested_pad_action=target_action,
+                required_work=(
+                    "Create and configure this PAD action manually."
+                ),
+            )
             return False
 
-        filled_line = self._fill_template(template, schema_entry, action, mapping)
+        action_id_lower = target_action.lower()
+
+        is_ui_action = (
+            action_id_lower.startswith("uiautomation.")
+            or action_id_lower.startswith("webautomation.")
+            or action_id_lower.startswith("sap.")
+        )
+
+        selector = action.get("selector")
+
+        if is_ui_action:
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "UiPath selectors cannot be imported directly as PAD "
+                    "UI elements"
+                ),
+                suggested_pad_action=target_action,
+                source_data={
+                    "UiPathSelector": selector or "Not available",
+                    "TargetApp": action.get("target_app"),
+                    "Properties": action.get(
+                        "properties",
+                        {},
+                    ),
+                    "Expressions": action.get(
+                        "expressions",
+                        {},
+                    ),
+                },
+                required_work=(
+                    "Capture or select the correct PAD UI element and "
+                    "attach it to this generated action. Verify the input "
+                    "value before execution."
+                ),
+            )
+
+        filled_line = self._fill_template(
+            template,
+            schema_entry,
+            action,
+            mapping,
+        )
+
+        if "<<PLACEHOLDER_" in filled_line:
+            placeholders = sorted(
+                set(
+                    re.findall(
+                        r"<<PLACEHOLDER_([^>]+)>>",
+                        filled_line,
+                    )
+                )
+            )
+
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "One or more required PAD parameters could not be "
+                    "resolved from the UiPath action"
+                ),
+                suggested_pad_action=target_action,
+                source_data={
+                    "MissingParameters": placeholders,
+                    "Properties": action.get(
+                        "properties",
+                        {},
+                    ),
+                    "Expressions": action.get(
+                        "expressions",
+                        {},
+                    ),
+                },
+                required_work=(
+                    "Configure the listed PAD parameters manually before "
+                    "running the flow."
+                ),
+            )
 
         self._add_line(filled_line)
         return True
@@ -866,49 +1089,116 @@ class PADScriptGenerator:
         if re.fullmatch(r'[A-Za-z_]\w*', value):
             value = f"%{value}%"
         if self._is_untranslatable(value):
-            original = properties.get("Value", "") or expressions.get("Value", "")
-            self._add_comment(f"MANUAL FIX VALUE: {original}")
+            original = (
+                properties.get("Value", "")
+                or expressions.get("Value", "")
+            )
+
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "The UiPath assignment expression could not be "
+                    "translated safely to PAD"
+                ),
+                suggested_pad_action="Set variable",
+                source_data={
+                    "TargetVariable": var_name,
+                    "OriginalExpression": original,
+                },
+                required_work=(
+                    "Replace MANUAL_Fix with the equivalent PAD "
+                    "expression and verify the variable type."
+                ),
+            )
+
             value = "'MANUAL_Fix'"
         self._ensure_variable(var_name)
 
         self._add_line(f"SET {var_name} TO {self._pad_set_value(value)}")
         
     def _generate_wait(self, action, mapping):
-        """Generate WAIT action."""
-        display_name = action.get("display_name", "")
+        """Generate only the executable WAIT action."""
         properties = action.get("properties", {})
 
-        duration = properties.get("Duration", "")
-        seconds = self._parse_duration_to_seconds(duration)
+        duration = properties.get(
+            "Duration",
+            "",
+        )
 
-        self._add_comment(f"{display_name}")
+        seconds = self._parse_duration_to_seconds(
+            duration
+        )
+
         self._add_line(f"WAIT {seconds}")
-
+        
     def _generate_subflow_call(self, action, mapping):
-        """Generate a schema-backed subflow call (never a bare keyword)."""
-        display_name = action.get("display_name", "")
-        properties = action.get("properties", {})
-        expressions = action.get("expressions", {})
+        """Generate a subflow call or one complete manual-review entry."""
+        properties = action.get("properties", {}) or {}
+        expressions = action.get("expressions", {}) or {}
 
         workflow_file = (
-            properties.get("WorkflowFileName", "") or
-            expressions.get("WorkflowFileName", "")
+            properties.get("WorkflowFileName", "")
+            or expressions.get("WorkflowFileName", "")
         )
-        subflow_name = Path(workflow_file).stem if workflow_file else display_name
-        subflow_name = self._clean_subflow_name(subflow_name)
+
+        display_name = action.get(
+            "display_name",
+            "",
+        )
+
+        subflow_name = (
+            Path(workflow_file).stem
+            if workflow_file
+            else display_name
+        )
+
+        subflow_name = self._clean_subflow_name(
+            subflow_name
+        )
 
         entry = self._find_flow_run_schema()
-        self._add_comment(f"{display_name}")
 
         if entry:
-            template = entry.get("RobinSyntaxTemplate", "")
-            filled = template.replace("''", f"'{subflow_name}'", 1)
-            self._add_line(filled)
-        else:
-            self._add_comment(
-                f"SUBFLOW CALL: {subflow_name} - add a 'Run desktop flow' action manually"
+            template = entry.get(
+                "RobinSyntaxTemplate",
+                "",
             )
 
+            if template:
+                filled = template.replace(
+                    "''",
+                    f"'{subflow_name}'",
+                    1,
+                )
+
+                self._add_line(filled)
+                return
+
+        self._add_manual_review(
+            action=action,
+            mapping=mapping,
+            reason=(
+                "No schema-backed PAD desktop-flow or subflow call could "
+                "be generated"
+            ),
+            suggested_pad_action=(
+                "Run desktop flow / Run subflow"
+            ),
+            source_data={
+                "WorkflowFileName": workflow_file,
+                "SubflowName": subflow_name,
+                "Arguments": (
+                    properties.get("Arguments")
+                    or expressions.get("Arguments")
+                    or ""
+                ),
+            },
+            required_work=(
+                f"Create a call to '{subflow_name}' and map all UiPath "
+                "input, output, and in/out arguments."
+            ),
+        )
     def _find_flow_run_schema(self):
         """Locate the schema action that runs another desktop flow."""
         for cand in ("Flow.RunDesktopFlow", "Flow.RunSubflow"):
@@ -923,54 +1213,170 @@ class PADScriptGenerator:
         return None
 
     def _generate_throw(self, action, mapping):
-        """Generate THROW ERROR."""
-        display_name = action.get("display_name", "")
-        properties = action.get("properties", {})
-        expressions = action.get("expressions", {})
-
-        message = (
-            properties.get("Exception", "") or
-            expressions.get("Exception", "") or
-            expressions.get("expression_0", "")
+        """Generate a PAD error action or one complete manual-review entry."""
+        target_action = mapping.get(
+            "target_action",
+            "ErrorHandling.ThrowError",
         )
 
-        if message:
-            message = self._translate_expression(message)
-            unbalanced = message.count("(") != message.count(")")
-            if (message.startswith("new ") or "Exception(" in message
-                    or message in ("'Exception'", "Exception")
-                    or "MANUAL_" in message
-                    or unbalanced or not message.strip()):
-                message = f"'{display_name}'"
-        else:
-            message = f"'{display_name}'"
+        schema_entry = self.lookup_schema(
+            target_action
+        )
 
-        self._add_comment(f"{display_name}")
-        self._add_comment(f"THROW (no Robin equivalent - raise manually if needed): {message}")
+        if schema_entry:
+            template = schema_entry.get(
+                "RobinSyntaxTemplate",
+                "",
+            )
 
+            if template:
+                filled_line = self._fill_template(
+                    template,
+                    schema_entry,
+                    action,
+                    mapping,
+                )
+
+                if "<<PLACEHOLDER_" not in filled_line:
+                    self._add_line(filled_line)
+                    return
+
+        properties = action.get("properties", {}) or {}
+        expressions = action.get("expressions", {}) or {}
+
+        exception_expression = (
+            properties.get("Exception")
+            or expressions.get("Exception")
+            or expressions.get("expression_0")
+            or action.get("display_name")
+            or "Unknown exception"
+        )
+
+        self._add_manual_review(
+            action=action,
+            mapping=mapping,
+            reason=(
+                "The UiPath Throw/Rethrow activity could not be converted "
+                "to a complete PAD error action"
+            ),
+            suggested_pad_action=(
+                "Throw error / Terminate flow"
+            ),
+            source_data={
+                "ExceptionExpression": exception_expression,
+            },
+            required_work=(
+                "Create the PAD error action manually and preserve the "
+                "original exception message and flow-termination behavior."
+            ),
+        )
+    
     def _generate_comment_action(self, action, mapping):
-        """Generate a comment line (includes notes so unmapped actions stay visible)."""
-        properties = action.get("properties", {})
-        text = properties.get("Text", "") or action.get("display_name", "Comment")
-        notes = mapping.get("notes", "")
-        if notes:
-            self._add_comment(f"{text} - {notes}")
-        else:
-            self._add_comment(text)
+        """Keep only comments representing unsupported source behavior."""
+        notes = str(
+            mapping.get("notes") or ""
+        ).strip()
 
+        source_action = str(
+            mapping.get("source_action")
+            or action.get("action_type")
+            or ""
+        )
+
+        searchable = (
+            f"{source_action} {notes}"
+        ).lower()
+
+        manual_markers = (
+            "no pad equivalent",
+            "replace with",
+            "manual",
+            "unsupported",
+            "orchestrator",
+            "work queue",
+            "queue",
+            "transaction",
+            "credential",
+            "asset",
+        )
+
+        if not any(
+            marker in searchable
+            for marker in manual_markers
+        ):
+            # Ordinary UiPath Comment/Annotation activity.
+            return
+
+        suggested_action = "Manual PAD replacement"
+
+        if (
+            "queue" in searchable
+            or "transaction" in searchable
+        ):
+            suggested_action = (
+                "PAD work queue, Excel, database, Dataverse, or API"
+            )
+        elif "credential" in searchable:
+            suggested_action = (
+                "PAD credential or secure-variable action"
+            )
+        elif "asset" in searchable:
+            suggested_action = (
+                "PAD variable, credential, environment variable, or API"
+            )
+        elif "log" in searchable:
+            suggested_action = "PAD logging action"
+
+        self._add_manual_review(
+            action=action,
+            mapping=mapping,
+            reason=(
+                notes
+                or "No direct PAD equivalent is available"
+            ),
+            suggested_pad_action=suggested_action,
+            required_work=(
+                "Select the replacement strategy, create the PAD action, "
+                "and map the source inputs and expected outputs."
+            ),
+        )
+        
     def _generate_unmapped(self, action, mapping):
-        """Generate placeholder for unmapped action."""
-        source_action = mapping.get("source_action", "")
-        display_name = action.get("display_name", "")
+        """Keep one complete manual-review entry for an unmapped action."""
+        source_action = mapping.get(
+            "source_action",
+            action.get(
+                "action_type",
+                "UnknownAction",
+            ),
+        )
+
+        confidence = mapping.get(
+            "confidence",
+            "low",
+        )
+
         notes = mapping.get("notes", "")
-        confidence = mapping.get("confidence", "low")
 
-        self._add_comment(f"TODO [UNMAPPED]: {source_action} - {display_name}")
-        self._add_comment(f"  Confidence: {confidence}")
-        if notes:
-            self._add_comment(f"  Notes: {notes}")
-        self._add_comment(f"  Manual migration required for this action")
-
+        self._add_manual_review(
+            action=action,
+            mapping=mapping,
+            reason=(
+                "No supported PAD action mapping is available"
+            ),
+            details=(
+                f"SourceAction={source_action}; "
+                f"Confidence={confidence}; Notes={notes}"
+            ),
+            suggested_pad_action=(
+                mapping.get("target_action")
+                or "Manual PAD action selection required"
+            ),
+            required_work=(
+                "Review the source action, select the closest PAD action, "
+                "and configure all required parameters."
+            ),
+        )
     # ------------------------------------------------------------------
     # Template filling
     # ------------------------------------------------------------------
@@ -1390,7 +1796,22 @@ class PADScriptGenerator:
             translated = self._translate_expression(condition)
             # Still contains .NET calls / placeholders -> not valid Robin
             if self._is_untranslatable(translated):
-                self._add_comment(f"MANUAL FIX CONDITION: {condition}")
+                self._add_manual_review(
+                    action=action,
+                    mapping=mapping,
+                    reason=(
+                        "The UiPath condition could not be translated "
+                        "safely to PAD"
+                    ),
+                    suggested_pad_action="PAD If/Loop condition",
+                    source_data={
+                        "OriginalCondition": condition,
+                    },
+                    required_work=(
+                        "Recreate this condition using PAD expression "
+                        "syntax and replace the temporary True condition."
+                    ),
+                )
                 return "True"
             # Strip redundant outer parentheses (PAD paste is strict)
             while len(translated) > 2 and translated.startswith("(") and translated.endswith(")"):
@@ -1609,32 +2030,194 @@ class PADScriptGenerator:
             self.script_lines.append(f"{indent}{line}")
 
     def _add_comment(self, text):
-        """Add a comment line to the script (official Robin comment syntax)."""
-        indent = self.INDENT * self.indent_level
-        self.script_lines.append(f"{indent}# {text}")
+        """Suppress ordinary informational comments.
 
-    
-    LINT_STRUCTURAL_RE = re.compile(
-        r"^("
-        r"IF\s+.+\s+THEN"
-        r"|ELSE(\s+IF\s+.+\s+THEN)?"
-        r"|END(\s+EXCEPTION)?"
-        r"|BEGIN\s+EXCEPTION"
-        r"|ON\s+ERROR"
-        r"|LOOP\s+WHILE\s+.+"
-        r"|LOOP\s+FOREACH\s+\S+\s+IN\s+.+"
-        r"|LOOP"
-        r"|SWITCH\s+.+"
-        r"|CASE\s+.+"
-        r"|DEFAULT"
-        r"|WAIT\s+.+"
-        r"|SET\s+[A-Za-z_]\w*\s+TO\s+.+"
-        r"|EXIT\s+LOOP"
-        r"|NEXT\s+LOOP"
-        r"|ON\s+BLOCK\s+ERROR"
-        r"|BLOCK"
-        r")$"
-    )
+        Required migration warnings must use _add_manual_review().
+        """
+        return
+
+    @staticmethod
+    def _compact_manual_value(value, max_length=350):
+        """Convert source information into safe single-line text."""
+        if value is None:
+            return ""
+
+        if isinstance(value, (dict, list, tuple, set)):
+            try:
+                text = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    default=str,
+                )
+            except Exception:
+                text = str(value)
+        else:
+            text = str(value)
+
+        text = re.sub(r"\s+", " ", text).strip()
+
+        # The pipe character separates fields in the review comment.
+        text = text.replace("|", "/")
+
+        if len(text) > max_length:
+            text = text[:max_length] + "...[truncated]"
+
+        return text
+
+    def _add_manual_review(
+        self,
+        action,
+        reason,
+        details=None,
+        mapping=None,
+        suggested_pad_action=None,
+        required_work=None,
+        source_data=None,
+    ):
+        """Create or update one structured manual-review line per action.
+
+        The line contains only information required by a PAD developer:
+        source action, display name, intended PAD action, source data,
+        reason, and required implementation work.
+        """
+        action = action or {}
+        mapping = mapping or {}
+
+        action_id = self._compact_manual_value(
+            action.get("action_id")
+            or f"manual_{len(self._manual_review_comments) + 1}"
+        )
+
+        action_type = self._compact_manual_value(
+            action.get("action_type")
+            or mapping.get("source_action")
+            or "UnknownAction"
+        )
+
+        display_name = self._compact_manual_value(
+            action.get("display_name")
+            or action_type
+        )
+
+        suggested_target = self._compact_manual_value(
+            suggested_pad_action
+            or mapping.get("target_action")
+            or "Manual PAD action selection required"
+        )
+
+        reason_text = self._compact_manual_value(
+            reason or "Manual implementation required"
+        )
+
+        details_text = self._compact_manual_value(details)
+        required_work_text = self._compact_manual_value(required_work)
+
+        if source_data is None:
+            source_data = {}
+
+            properties = action.get("properties", {}) or {}
+            expressions = action.get("expressions", {}) or {}
+            selector = action.get("selector")
+
+            relevant_keys = (
+                "Text",
+                "Value",
+                "Condition",
+                "Expression",
+                "WorkflowFileName",
+                "FileName",
+                "FilePath",
+                "Path",
+                "Url",
+                "To",
+                "From",
+                "Result",
+                "Exception",
+                "Message",
+                "SheetName",
+                "Range",
+            )
+
+            for key in relevant_keys:
+                if key in properties and properties[key] not in ("", None):
+                    source_data[key] = properties[key]
+                elif key in expressions and expressions[key] not in ("", None):
+                    source_data[key] = expressions[key]
+
+            if selector:
+                source_data["UiPathSelector"] = selector
+
+        source_data_text = self._compact_manual_value(source_data)
+
+        issue_parts = [reason_text]
+
+        if details_text:
+            issue_parts.append(details_text)
+
+        if required_work_text:
+            issue_parts.append(
+                f"RequiredWork={required_work_text}"
+            )
+
+        issue_text = "; ".join(
+            part for part in issue_parts if part
+        )
+
+        existing = self._manual_review_comments.get(action_id)
+
+        if existing:
+            if issue_text not in existing["issues"]:
+                existing["issues"].append(issue_text)
+
+            combined_issues = "; ".join(existing["issues"])
+
+            parts = [
+                "[MANUAL REVIEW]",
+                f"SourceId={action_id}",
+                f"UiPathAction={action_type}",
+                f"Name={display_name}",
+                f"SuggestedPAD={suggested_target}",
+                f"Reason={combined_issues}",
+            ]
+
+            if source_data_text:
+                parts.append(
+                    f"SourceData={source_data_text}"
+                )
+
+            indent = self.INDENT * existing["indent_level"]
+
+            self.script_lines[existing["line_index"]] = (
+                f"{indent}# " + " | ".join(parts)
+            )
+            return
+
+        parts = [
+            "[MANUAL REVIEW]",
+            f"SourceId={action_id}",
+            f"UiPathAction={action_type}",
+            f"Name={display_name}",
+            f"SuggestedPAD={suggested_target}",
+            f"Reason={issue_text}",
+        ]
+
+        if source_data_text:
+            parts.append(
+                f"SourceData={source_data_text}"
+            )
+
+        indent = self.INDENT * self.indent_level
+        line_index = len(self.script_lines)
+
+        self.script_lines.append(
+            f"{indent}# " + " | ".join(parts)
+        )
+
+        self._manual_review_comments[action_id] = {
+            "line_index": line_index,
+            "indent_level": self.indent_level,
+            "issues": [issue_text],
+        }
     
     def _declare_missing_variables(self):
         """PERMANENT FIX: PAD paste aborts on %variables% that are not declared
@@ -1649,9 +2232,10 @@ class PADScriptGenerator:
         if not missing:
             return
 
-        block = ["# Auto-declared variables referenced by migrated actions"]
-        block += [f"SET {self._safe_var(v)} TO ''" for v in missing]
-
+        block = [
+            f"SET {self._safe_var(variable_name)} TO ''"
+            for variable_name in missing
+        ]
         # Insert after the header (first blank line); all SETs precede use
         insert_at = 0
         for i, line in enumerate(self.script_lines):
@@ -1664,25 +2248,55 @@ class PADScriptGenerator:
         logger.info(f"Auto-declared {len(missing)} referenced variable(s)")
 
     def _lint_script(self, script):
-        """PERMANENT SAFETY NET: neutralize any line that is not provably
-        valid Robin (structural keyword form or known schema ActionId).
-        Guarantees one bad action can never break the whole file."""
-        out = []
+        """Neutralize only lines that are not provably valid Robin."""
+        output_lines = []
+
         for line in script.split("\n"):
             stripped = line.strip()
-            if not stripped or stripped.startswith("#") or stripped.startswith("//"):
-                out.append(line)
+
+            if (
+                not stripped
+                or stripped.startswith("#")
+                or stripped.startswith("//")
+            ):
+                output_lines.append(line)
                 continue
-            # Robin strings are single-quoted only - never emit double quotes
+
             line = line.replace('""', "''")
             stripped = line.strip()
+
             if self._is_valid_robin_line(stripped):
-                out.append(line)
-            else:
-                indent = line[: len(line) - len(line.lstrip())]
-                out.append(f"{indent}# [AUTO-NEUTRALIZED - verify manually] {stripped}")
-                logger.warning(f"Lint neutralized invalid line: {stripped[:80]}")
-        return "\n".join(out)
+                output_lines.append(line)
+                continue
+
+            indent = line[
+                :len(line) - len(line.lstrip())
+            ]
+
+            compact_original = re.sub(
+                r"\s+",
+                " ",
+                stripped,
+            )
+
+            output_lines.append(
+                f"{indent}# [MANUAL REVIEW] "
+                f"SourceId=generated_line | "
+                f"UiPathAction=Unknown | "
+                f"Name=Invalid generated Robin line | "
+                f"SuggestedPAD=Review source mapping | "
+                f"Reason=The generated line was not recognized as valid "
+                f"Robin syntax | "
+                f"SourceData={{\"OriginalRobin\": "
+                f"\"{compact_original}\"}}"
+            )
+
+            logger.warning(
+                "Lint neutralized invalid line: %s",
+                stripped[:80],
+            )
+
+        return "\n".join(output_lines)
 
     def _is_valid_robin_line(self, stripped):
         if self.LINT_STRUCTURAL_RE.match(stripped):
@@ -1847,18 +2461,39 @@ class PADScriptGenerator:
                         line_number,
                     )
                 else:
-                    # Preserve traceability. This makes the script
-                    # syntactically safer but requires manual review.
-                    lines[line_index] = (
-                        f"{indent}# [MANUAL - DLL rejected] "
-                        f"{stripped_line}"
+                    # Keep all information about the rejected Robin line in
+                    # one concise manual-review comment.
+                    clean_message = re.sub(
+                        r"\s+",
+                        " ",
+                        str(message or "").strip(),
                     )
+
+                    clean_original = re.sub(
+                        r"\s+",
+                        " ",
+                        str(stripped_line or "").strip(),
+                    )
+
+                    if not clean_message:
+                        clean_message = (
+                            "PAD parser rejected the generated Robin syntax"
+                        )
+
+                    lines[line_index] = (
+                        f"{indent}# [MANUAL REVIEW] "
+                        f"Action=GeneratedRobinLine | "
+                        f"Name=PAD DLL rejected line | "
+                        f"Reason={clean_message} | "
+                        f"Original={clean_original}"
+                    )
+
                     fixed_any = True
 
                     logger.warning(
                         "Neutralized PAD-rejected line %d: %s",
                         line_number,
-                        stripped_line,
+                        clean_original,
                     )
 
             # Structural errors must be handled by RepairEngine or by fixing
