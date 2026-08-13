@@ -160,90 +160,633 @@ class MappingEngine:
 
         return str(value).lower()
 
-    def _enrich_action_context(self, action, action_index):
-        """Add inherited application context from parent activities.
+    def _enrich_action_context(
+        self,
+        action,
+        action_index,
+        ordered_actions,
+        workflow_context,
+    ):
+        """Enrich an action with application context.
 
-        UiPath TypeInto activities often keep browser information on an
-        OpenBrowser, AttachBrowser, or UseApplicationBrowser ancestor instead
-        of on the TypeInto activity itself.
+        Context priority:
+        1. Current action
+        2. Parent/ancestor actions
+        3. Nearest preceding browser/application scope
+        4. Unambiguous workflow-level context
         """
         enriched = dict(action)
 
         context_parts = []
         detected_apps = []
+        context_sources = []
 
+        def add_action_context(context_action, source_name):
+            if not context_action:
+                return
+
+            values = (
+                context_action.get("action_type"),
+                context_action.get("display_name"),
+                context_action.get("selector"),
+                context_action.get("properties"),
+                context_action.get("expressions"),
+                context_action.get("target_app"),
+            )
+
+            added = False
+
+            for value in values:
+                text = self._normalize_context_value(value)
+                if text:
+                    context_parts.append(text)
+                    added = True
+
+            target_app = self._normalize_context_value(
+                context_action.get("target_app")
+            )
+
+            if target_app not in {
+                "",
+                "none",
+                "unknown",
+                "unknownapp",
+            }:
+                detected_apps.append(target_app)
+
+            if added:
+                context_sources.append(source_name)
+
+        # ----------------------------------------------------------
+        # 1. Current action
+        # ----------------------------------------------------------
+        add_action_context(action, "current_action")
+
+        # ----------------------------------------------------------
+        # 2. Parent and ancestor context
+        # ----------------------------------------------------------
         current = action
         visited = set()
 
-        # Include current action and then walk through its ancestors.
         for _ in range(50):
-            if not current:
-                break
-
-            current_id = current.get("action_id")
-
-            if current_id and current_id in visited:
-                break
-
-            if current_id:
-                visited.add(current_id)
-
-            context_parts.extend(
-                [
-                    self._normalize_context_value(
-                        current.get("action_type")
-                    ),
-                    self._normalize_context_value(
-                        current.get("display_name")
-                    ),
-                    self._normalize_context_value(
-                        current.get("selector")
-                    ),
-                    self._normalize_context_value(
-                        current.get("properties")
-                    ),
-                    self._normalize_context_value(
-                        current.get("expressions")
-                    ),
-                ]
-            )
-
-            target_app = self._normalize_context_value(
-                current.get("target_app")
-            )
-
-            if target_app and target_app not in (
-                "unknownapp",
-                "unknown",
-                "none",
-            ):
-                detected_apps.append(target_app)
-
             parent_id = current.get("parent_id")
 
-            if not parent_id:
+            if not parent_id or parent_id in visited:
                 break
 
-            current = action_index.get(parent_id)
+            visited.add(parent_id)
+            parent = action_index.get(parent_id)
 
-        enriched["_inherited_context"] = " ".join(
-            part for part in context_parts if part
+            if not parent:
+                break
+
+            add_action_context(parent, "ancestor")
+            current = parent
+
+        # ----------------------------------------------------------
+        # 3. Nearest preceding browser/application scope
+        # ----------------------------------------------------------
+        current_id = action.get("action_id")
+        current_position = None
+
+        for index, candidate in enumerate(ordered_actions):
+            if candidate.get("action_id") == current_id:
+                current_position = index
+                break
+
+        if current_position is not None:
+            scope_markers = (
+                "openbrowser",
+                "attachbrowser",
+                "useapplicationbrowser",
+                "browser",
+                "applicationcard",
+                "napplicationcard",
+                "useapplication",
+                "openapplication",
+                "attachwindow",
+            )
+
+            # Walk backward and use the nearest relevant scope.
+            for candidate in reversed(
+                ordered_actions[:current_position]
+            ):
+                candidate_type = re.sub(
+                    r"[^a-z0-9]",
+                    "",
+                    str(
+                        candidate.get("action_type") or ""
+                    ).lower(),
+                )
+
+                candidate_text = " ".join(
+                    (
+                        self._normalize_context_value(
+                            candidate.get("action_type")
+                        ),
+                        self._normalize_context_value(
+                            candidate.get("display_name")
+                        ),
+                        self._normalize_context_value(
+                            candidate.get("selector")
+                        ),
+                        self._normalize_context_value(
+                            candidate.get("properties")
+                        ),
+                        self._normalize_context_value(
+                            candidate.get("target_app")
+                        ),
+                    )
+                )
+
+                is_relevant_scope = (
+                    any(
+                        marker in candidate_type
+                        for marker in scope_markers
+                    )
+                    or any(
+                        marker in candidate_text
+                        for marker in (
+                            "chrome",
+                            "msedge",
+                            "firefox",
+                            "iexplore",
+                            "browser",
+                            "webctrl",
+                            "saplogon",
+                            "sap gui",
+                            "notepad.exe",
+                            "application",
+                        )
+                    )
+                )
+
+                if is_relevant_scope:
+                    add_action_context(
+                        candidate,
+                        "nearest_preceding_scope",
+                    )
+                    break
+
+        # ----------------------------------------------------------
+        # 4. Workflow-level fallback
+        # ----------------------------------------------------------
+        workflow_kind = workflow_context.get(
+            "dominant_kind",
+            "unknown",
         )
 
-        enriched["_inherited_target_apps"] = detected_apps
+        if workflow_kind in {"web", "sap", "window"}:
+            context_parts.append(
+                workflow_context.get("searchable", "")
+            )
+            context_sources.append(
+                f"workflow_{workflow_kind}"
+            )
 
-        # Preserve the closest useful inherited target application.
+            workflow_app = workflow_context.get(
+                "target_app",
+                "",
+            )
+
+            if workflow_app:
+                detected_apps.append(workflow_app)
+
+        enriched["_inherited_context"] = " ".join(
+            part
+            for part in context_parts
+            if part
+        )
+
+        enriched["_inherited_target_apps"] = list(
+            dict.fromkeys(detected_apps)
+        )
+
+        enriched["_context_sources"] = list(
+            dict.fromkeys(context_sources)
+        )
+
         own_target_app = self._normalize_context_value(
             action.get("target_app")
         )
 
         if (
-            own_target_app in ("", "unknown", "unknownapp", "none")
+            own_target_app in {
+                "",
+                "none",
+                "unknown",
+                "unknownapp",
+            }
             and detected_apps
         ):
             enriched["target_app"] = detected_apps[0]
 
         return enriched
+    
+    def _build_workflow_context(self, actions):
+        """Determine an unambiguous workflow-level application context."""
+        context_parts = []
+        target_apps = []
+
+        for action in actions:
+            context_parts.extend(
+                [
+                    self._normalize_context_value(
+                        action.get("action_type")
+                    ),
+                    self._normalize_context_value(
+                        action.get("display_name")
+                    ),
+                    self._normalize_context_value(
+                        action.get("selector")
+                    ),
+                    self._normalize_context_value(
+                        action.get("properties")
+                    ),
+                    self._normalize_context_value(
+                        action.get("expressions")
+                    ),
+                ]
+            )
+
+            target_app = self._normalize_context_value(
+                action.get("target_app")
+            )
+
+            if target_app not in {
+                "",
+                "none",
+                "unknown",
+                "unknownapp",
+            }:
+                target_apps.append(target_app)
+
+        searchable = " ".join(
+            part
+            for part in context_parts
+            if part
+        )
+
+        web_markers = (
+            "openbrowser",
+            "attachbrowser",
+            "useapplicationbrowser",
+            "napplicationcard",
+            "chrome",
+            "chrome.exe",
+            "msedge",
+            "msedge.exe",
+            "firefox",
+            "firefox.exe",
+            "iexplore",
+            "browser",
+            "webctrl",
+            "<webctrl",
+            "<html",
+            "web page",
+            "webpage",
+            "rpachallenge.com",
+            "rpa challenge",
+        )
+
+        sap_markers = (
+            "saplogon",
+            "saplogon.exe",
+            "sap gui",
+            "sapgui",
+            "sap session",
+            "sap scripting",
+        )
+
+        window_markers = (
+            "notepad.exe",
+            "winword.exe",
+            "excel.exe",
+            "desktop application",
+            "attachwindow",
+            "openapplication",
+        )
+
+        has_web = any(
+            marker in searchable
+            for marker in web_markers
+        )
+
+        has_sap = any(
+            marker in searchable
+            for marker in sap_markers
+        )
+
+        has_window = any(
+            marker in searchable
+            for marker in window_markers
+        )
+
+        # Use workflow fallback only when the context is unambiguous.
+        detected_count = sum(
+            (has_web, has_sap, has_window)
+        )
+
+        if detected_count == 1:
+            if has_sap:
+                dominant_kind = "sap"
+            elif has_web:
+                dominant_kind = "web"
+            else:
+                dominant_kind = "window"
+        else:
+            dominant_kind = "unknown"
+
+        target_app = (
+            target_apps[0]
+            if target_apps
+            else ""
+        )
+
+        return {
+            "dominant_kind": dominant_kind,
+            "searchable": searchable,
+            "target_app": target_app,
+        }
+    
+    @staticmethod
+    def _is_text_entry_activity(source_type, mapped_target=""):
+        """Identify UiPath text-entry activities robustly.
+
+        Supports standard, modern and generic activity names such as:
+        TypeInto, TypeInto<String>, NTypeInto, SetText and EnterText.
+        """
+        base_type = (
+            str(source_type or "")
+            .split("<", 1)[0]
+            .split("(", 1)[0]
+            .strip()
+        )
+
+        normalized_source = re.sub(
+            r"[^a-z0-9]",
+            "",
+            base_type.lower(),
+        )
+
+        exact_types = {
+            "typeinto",
+            "ntypeinto",
+            "settext",
+            "typetext",
+            "entertext",
+            "writetext",
+            "populatefield",
+            "populatetextfield",
+        }
+
+        if normalized_source in exact_types:
+            return True
+
+        # Handle namespace/prefix variations without matching unrelated types.
+        if normalized_source.endswith("typeinto"):
+            return True
+
+        normalized_target = re.sub(
+            r"[^a-z0-9]",
+            "",
+            str(mapped_target or "").lower(),
+        )
+
+        return (
+            "populate" in normalized_target
+            and "text" in normalized_target
+            and "field" in normalized_target
+        )
+    
+    @staticmethod
+    def _detect_browser_kind(ir_action):
+        """Detect the requested browser from current/inherited IR context."""
+        searchable = " ".join(
+            (
+                str(ir_action.get("target_app") or "").lower(),
+                str(ir_action.get("selector") or "").lower(),
+                json.dumps(
+                    ir_action.get("properties", {}) or {},
+                    ensure_ascii=False,
+                    default=str,
+                ).lower(),
+                json.dumps(
+                    ir_action.get("expressions", {}) or {},
+                    ensure_ascii=False,
+                    default=str,
+                ).lower(),
+                str(
+                    ir_action.get("_inherited_context") or ""
+                ).lower(),
+            )
+        )
+
+        if "firefox" in searchable:
+            return "firefox"
+
+        if (
+            "msedge" in searchable
+            or "edge.exe" in searchable
+            or re.search(r"\bedge\b", searchable)
+        ):
+            return "edge"
+
+        if "iexplore" in searchable or "internet explorer" in searchable:
+            return "internet_explorer"
+
+        if "chrome" in searchable:
+            return "chrome"
+
+        return None
+
+    def _find_browser_launch_schema_action(self, browser_kind):
+        """Find an exact normal browser-launch action from the PAD schema."""
+        preferred_action_ids = {
+            "chrome": (
+                "WebAutomation.LaunchChrome.LaunchChrome",
+            ),
+            "edge": (
+                "WebAutomation.LaunchEdge.LaunchEdge",
+            ),
+            "firefox": (
+                "WebAutomation.LaunchFirefox.LaunchFirefox",
+            ),
+            "internet_explorer": (
+                "WebAutomation.LaunchInternetExplorer."
+                "LaunchInternetExplorer",
+            ),
+        }
+
+        for action_id in preferred_action_ids.get(
+            browser_kind,
+            (),
+        ):
+            if action_id in self.pad_schema_index:
+                return action_id
+
+            action_lower = action_id.lower()
+
+            if action_lower in self._action_id_lower:
+                return self._action_id_lower[
+                    action_lower
+                ]["ActionId"]
+
+        browser_tokens = {
+            "chrome": ("launchchrome", "chrome"),
+            "edge": ("launchedge", "edge"),
+            "firefox": ("launchfirefox", "firefox"),
+            "internet_explorer": (
+                "launchinternetexplorer",
+                "internetexplorer",
+                "iexplore",
+            ),
+        }
+
+        candidates = []
+
+        for entry in self.pad_schema:
+            action_id = str(
+                entry.get("ActionId") or ""
+            ).strip()
+
+            display_name = str(
+                entry.get("DisplayName") or ""
+            ).strip()
+
+            template = str(
+                entry.get("RobinSyntaxTemplate") or ""
+            ).strip()
+
+            if not action_id or not template:
+                continue
+
+            action_lower = action_id.lower()
+            searchable = (
+                action_lower
+                + " "
+                + display_name.lower()
+            )
+
+            tokens = browser_tokens.get(
+                browser_kind,
+                (),
+            )
+
+            if not all(
+                token in searchable
+                for token in tokens
+            ):
+                continue
+
+            # Exclude attach and alternate/error-dialog launch variants.
+            excluded_markers = (
+                "attach",
+                "foreground",
+                "customprofile",
+                "custom profile",
+                "nowait",
+                "no wait",
+                "withdriver",
+                "with driver",
+                "closedialog",
+                "close dialog",
+                "pressdialogbutton",
+                "press dialog button",
+            )
+
+            if any(
+                marker in action_lower.replace(".", "")
+                or marker in searchable
+                for marker in excluded_markers
+            ):
+                continue
+
+            score = 0
+
+            action_suffix = action_id.split(".")[-1].lower()
+
+            expected_suffix = {
+                "chrome": "launchchrome",
+                "edge": "launchedge",
+                "firefox": "launchfirefox",
+                "internet_explorer": (
+                    "launchinternetexplorer"
+                ),
+            }.get(browser_kind)
+
+            if action_suffix == expected_suffix:
+                score += 100
+
+            if action_lower.startswith("webautomation."):
+                score += 50
+
+            candidates.append(
+                (score, action_id)
+            )
+
+        if not candidates:
+            logger.warning(
+                "No normal launch action found for browser: %s",
+                browser_kind,
+            )
+            return None
+
+        candidates.sort(
+            key=lambda item: (
+                -item[0],
+                item[1].lower(),
+            )
+        )
+
+        selected = candidates[0][1]
+
+        logger.info(
+            "Selected %s launch action: %s",
+            browser_kind,
+            selected,
+        )
+
+        return selected
+
+    @staticmethod
+    def _is_browser_launch_activity(source_type, mapped_target=""):
+        """Identify UiPath browser launch/open activities."""
+        normalized_source = re.sub(
+            r"[^a-z0-9]",
+            "",
+            str(source_type or "")
+            .split("<", 1)[0]
+            .lower(),
+        )
+
+        if normalized_source in {
+            "openbrowser",
+            "nopenbrowser",
+            "useapplicationbrowser",
+            "napplicationcard",
+            "launchbrowser",
+        }:
+            return True
+
+        normalized_target = re.sub(
+            r"[^a-z0-9]",
+            "",
+            str(mapped_target or "").lower(),
+        )
+
+        return (
+            "launch" in normalized_target
+            and any(
+                browser in normalized_target
+                for browser in (
+                    "chrome",
+                    "edge",
+                    "firefox",
+                    "internetexplorer",
+                )
+            )
+        )
     
     # ------------------------------------------------------------------
     # Main mapping interface
@@ -314,34 +857,128 @@ class MappingEngine:
         )
 
         if mapping:
-            source_base_type = (
-                source_type
-                .split("<", 1)[0]
-                .split("(", 1)[0]
-                .strip()
-            )
-
-            normalized_source = re.sub(
-                r"[^a-z0-9]",
+            mapped_target = mapping.get(
+                "target_action",
                 "",
-                source_base_type.lower(),
             )
 
-            text_entry_source_types = {
-                "typeinto",
-                "settext",
-                "typetext",
-                "entertext",
-                "writetext",
-            }
+            # ------------------------------------------------------
+            # A. Browser launch/open activities
+            # ------------------------------------------------------
+            if self._is_browser_launch_activity(
+                source_type=source_type,
+                mapped_target=mapped_target,
+            ):
+                browser_kind = self._detect_browser_kind(
+                    ir_action
+                )
 
-            if normalized_source in text_entry_source_types:
-                # The mapping sheet establishes that this is a text-entry
-                # activity. IR context decides whether PAD must use the web,
-                # window, or SAP variant.
+                if browser_kind:
+                    target = (
+                        self._find_browser_launch_schema_action(
+                            browser_kind
+                        )
+                        or "UNMAPPED"
+                    )
+
+                    context_note = (
+                        f"Detected {browser_kind} browser context; "
+                        "selected exact browser launch action."
+                    )
+                else:
+                    # Do not guess Chrome when the source does not identify
+                    # the browser.
+                    target = "UNMAPPED"
+
+                    context_note = (
+                        "Browser launch activity detected, but the browser "
+                        "type could not be determined from the IR."
+                    )
+
+                parameter_mapping = mapping.get(
+                    "parameter_mapping",
+                    {},
+                )
+
+                notes = " | ".join(
+                    part
+                    for part in (
+                        mapping.get("notes", ""),
+                        context_note,
+                    )
+                    if part
+                )
+
+            # ------------------------------------------------------
+            # B. TypeInto / SetText activities
+            # ------------------------------------------------------
+            elif self._is_text_entry_activity(
+                source_type=source_type,
+                mapped_target=mapped_target,
+            ):
+                # Resolve web, window, or SAP using current action,
+                # ancestors, nearest application scope, and workflow context.
                 target = self._resolve_text_entry_action(
                     ir_action
                 )
+
+                is_web_context = self._is_web_target(
+                    ir_action
+                )
+
+                is_sap_context = (
+                    self._is_confirmed_sap_target(
+                        ir_action
+                    )
+                )
+
+                # A confirmed browser action must use the web action whenever
+                # the authoritative PAD schema contains one.
+                if (
+                    is_web_context
+                    and target.startswith("UIAutomation.")
+                ):
+                    web_target = (
+                        self._find_text_entry_schema_action(
+                            "web"
+                        )
+                    )
+
+                    if web_target:
+                        logger.warning(
+                            "Corrected window text-entry mapping to web "
+                            "mapping for '%s': %s -> %s",
+                            display_name,
+                            target,
+                            web_target,
+                        )
+                        target = web_target
+
+                # Never allow an SAP action for a non-SAP source context.
+                if (
+                    not is_sap_context
+                    and target.startswith("SAP.")
+                ):
+                    logger.warning(
+                        "Rejected SAP text-entry action for non-SAP "
+                        "activity '%s'",
+                        display_name,
+                    )
+
+                    if is_web_context:
+                        target = (
+                            self._find_text_entry_schema_action(
+                                "web"
+                            )
+                            or "UNMAPPED"
+                        )
+                    else:
+                        target = (
+                            self._find_text_entry_schema_action(
+                                "window"
+                            )
+                            or "UNMAPPED"
+                        )
 
                 parameter_mapping = (
                     self._build_text_entry_parameter_mapping(
@@ -355,12 +992,12 @@ class MappingEngine:
                     else {}
                 )
 
-                if self._is_confirmed_sap_target(ir_action):
+                if is_sap_context:
                     context_note = (
-                        "Confirmed SAP target; selected SAP text-entry "
-                        "action."
+                        "Confirmed SAP target; selected SAP Populate "
+                        "Text Field action."
                     )
-                elif self._is_web_target(ir_action):
+                elif is_web_context:
                     context_note = (
                         "Browser/web target; selected Populate Text "
                         "Field on Web Page."
@@ -371,20 +1008,21 @@ class MappingEngine:
                         "Text Field in Window."
                     )
 
-                original_notes = mapping.get("notes", "")
-
                 notes = " | ".join(
                     part
                     for part in (
-                        original_notes,
+                        mapping.get("notes", ""),
                         context_note,
                     )
                     if part
                 )
 
+            # ------------------------------------------------------
+            # C. All other mapping-sheet activities
+            # ------------------------------------------------------
             else:
                 target = self.resolve_pad_action_id(
-                    mapping["target_action"]
+                    mapped_target
                 )
 
                 parameter_mapping = mapping.get(
@@ -394,12 +1032,14 @@ class MappingEngine:
 
                 notes = mapping.get("notes", "")
 
-                # Final safety rule: a normal source action must never map
-                # to an SAP action unless the IR confirms SAP.
+                # A generic non-SAP source action must not accidentally use
+                # an SAP action with the same display name.
                 if (
                     target
                     and target.lower().startswith("sap.")
-                    and not self._is_confirmed_sap_target(ir_action)
+                    and not self._is_confirmed_sap_target(
+                        ir_action
+                    )
                 ):
                     logger.warning(
                         "Rejected SAP action '%s' for non-SAP source "
@@ -410,6 +1050,7 @@ class MappingEngine:
 
                     target = "UNMAPPED"
                     parameter_mapping = {}
+
                     notes = (
                         f"{notes} | Rejected ambiguous SAP mapping "
                         "because the source target is not SAP."
@@ -469,7 +1110,7 @@ class MappingEngine:
         )
 
     def map_all_actions(self, ir_data):
-        """Map all IR actions with inherited application context."""
+        """Map all actions using inherited and workflow-level context."""
         all_mappings = []
 
         if "workflows" in ir_data:
@@ -486,10 +1127,39 @@ class MappingEngine:
                 if action.get("action_id")
             }
 
+            ordered_actions = sorted(
+                actions,
+                key=lambda item: (
+                    str(item.get("parent_id") or ""),
+                    int(item.get("order", 0)),
+                ),
+            )
+
+            # Preserve flattened IR order as the primary positional order.
+            # Python dictionaries/lists retain source order.
+            ordered_actions = list(actions)
+
+            workflow_context = (
+                self._build_workflow_context(actions)
+            )
+
+            logger.info(
+                "Workflow '%s' detected context: %s",
+                workflow.get("workflow_name", ""),
+                workflow_context.get(
+                    "dominant_kind",
+                    "unknown",
+                ),
+            )
+
             for action in actions:
-                contextual_action = self._enrich_action_context(
-                    action,
-                    action_index,
+                contextual_action = (
+                    self._enrich_action_context(
+                        action=action,
+                        action_index=action_index,
+                        ordered_actions=ordered_actions,
+                        workflow_context=workflow_context,
+                    )
                 )
 
                 mapping = self.map_action(
@@ -501,13 +1171,33 @@ class MappingEngine:
                     "",
                 )
 
+                mapping["detected_context"] = {
+                    "target_app": contextual_action.get(
+                        "target_app"
+                    ),
+                    "sources": contextual_action.get(
+                        "_context_sources",
+                        [],
+                    ),
+                    "is_web": self._is_web_target(
+                        contextual_action
+                    ),
+                    "is_sap": self._is_confirmed_sap_target(
+                        contextual_action
+                    ),
+                    "workflow_kind": workflow_context.get(
+                        "dominant_kind",
+                        "unknown",
+                    ),
+                }
+
                 all_mappings.append(mapping)
 
         summary = self._build_mapping_summary(
             all_mappings
         )
 
-        result = {
+        return {
             "mappings": all_mappings,
             "summary": summary,
             "unmapped": summary.get(
@@ -515,18 +1205,6 @@ class MappingEngine:
                 [],
             ),
         }
-
-        logger.info(
-            "Mapping complete: %s actions, %s high, %s medium, "
-            "%s low, %s unmapped",
-            summary["total"],
-            summary["high_confidence"],
-            summary["medium_confidence"],
-            summary["low_confidence"],
-            summary["unmapped_count"],
-        )
-
-        return result
 
     # ------------------------------------------------------------------
     # Step 1: Mapping sheet lookup
@@ -1579,10 +2257,11 @@ class MappingEngine:
             "create folder": "Folder.Create",
             "delete folder": "Folder.Delete",
             # Web
-            "launch chrome": "WebAutomation.LaunchChrome",
-            "launch firefox": "WebAutomation.LaunchFirefox",
-            "launch edge": "WebAutomation.LaunchEdge",
-            "open browser": "WebAutomation.LaunchChrome",
+            "launch chrome": "WebAutomation.LaunchChrome.LaunchChrome",
+            "launch firefox": "WebAutomation.LaunchFirefox.LaunchFirefox",
+            "launch edge": "WebAutomation.LaunchEdge.LaunchEdge",
+            "open browser": "WebAutomation.LaunchChrome.LaunchChrome",
+            "launch new chrome/edge/firefox": "WebAutomation.LaunchChrome.LaunchChrome",
             "go to web page": "WebAutomation.GoToWebPage",
             "navigate to": "WebAutomation.GoToWebPage",
             "close web browser": "WebAutomation.CloseWebBrowser",
