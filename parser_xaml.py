@@ -113,6 +113,7 @@ ACTIVITY_PATTERNS = {
     "MessageBox": "MessageBox",
     "InputDialog": "InputDialog",
     "LogMessage": "LogMessage",
+    "WriteLine": "WriteLine",
 
     # Invoke
     "InvokeWorkflowFile": "InvokeWorkflowFile",

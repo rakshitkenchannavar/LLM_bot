@@ -1399,13 +1399,31 @@ class MappingEngine:
                 "notes": "MultipleAssign split into multiple SetVariable",
             }
 
-        # Dialogs
-        if source_lower == "logmessage":
+        # UiPath logging activities must write silently to a file.
+        if source_lower in ("logmessage", "writeline"):
+            if "File.WriteText" not in self.pad_schema_index:
+                return {
+                    "target_action": "UNMAPPED",
+                    "confidence": "low",
+                    "parameter_mapping": {},
+                    "notes": (
+                        "PAD schema action File.WriteText was not found"
+                    ),
+                }
+
             return {
-                "target_action": "Display.ShowMessageDialog",
-                "confidence": "medium",
-                "parameter_mapping": {"Message": "Message"},
-                "notes": "LogMessage mapped to ShowMessageDialog",
+                "target_action": "File.WriteText",
+                "confidence": "high",
+                "parameter_mapping": {
+                    "Message": "TextToWrite",
+                    "Text": "TextToWrite",
+                    "Value": "TextToWrite",
+                    "Expression": "TextToWrite",
+                },
+                "notes": (
+                    "UiPath logging activity mapped to PAD Write text "
+                    "to file in append mode"
+                ),
             }
 
         if source_lower == "messagebox":
@@ -2222,11 +2240,16 @@ class MappingEngine:
             "display message box": "Display.ShowMessageDialog",
             "show message": "Display.ShowMessageDialog",
             "message box": "Display.ShowMessageDialog",
-            "log message": "Display.ShowMessageDialog",
             "display input dialog": "Display.InputDialog",
             "input dialog": "Display.InputDialog",
             "display select file dialog": "Display.SelectFileDialog",
             "display select folder dialog": "Display.SelectFolderDialog",
+            # Logging
+            "log message": "File.WriteText",
+            "logmessage": "File.WriteText",
+            "write line": "File.WriteText",
+            "writeline": "File.WriteText",
+            "write text to file": "File.WriteText",
             # Excel
             "launch excel": "Excel.LaunchExcel",
             "close excel": "Excel.CloseExcel",
