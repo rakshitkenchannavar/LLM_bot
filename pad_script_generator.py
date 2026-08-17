@@ -144,7 +144,8 @@ class PADScriptGenerator:
 
             self._declare_missing_variables()
             script = self._lint_script("\n".join(self.script_lines))
-
+            script = self._remove_empty_structures(script)
+            self._check_block_balance(script)
             if best_script is None:
                 best_script, best_grammar = script, grammar
 
@@ -266,7 +267,13 @@ class PADScriptGenerator:
         mapping = mapping_lookup.get(action_id)
 
         if not mapping:
-            self._add_comment(f"UNMAPPED: {action_type} - {display_name} (no mapping found)")
+            self._add_manual_review(
+                action=action,
+                reason="No target mapping was found",
+                required_work=(
+                    "Create the corresponding PAD action manually."
+                ),
+            )
             self._generate_children(action, mapping_lookup, all_actions)
             return
 
@@ -482,7 +489,17 @@ class PADScriptGenerator:
         target_action = mapping.get("target_action", "")
 
         if target_action == "Loops.ForEach":
-            item_var = self._resolve_param(action, mapping, "CurrentItem", "CurrentItem")
+            item_var = self._resolve_param(
+                action, mapping, "CurrentItem", "CurrentItem"
+            )
+
+            # Nested loops must not share the same item variable.
+            if item_var == "CurrentItem":
+                item_var = re.sub(
+                    r"[^A-Za-z0-9_]",
+                    "_",
+                    f"CurrentItem_{action.get('action_id', 'x')}",
+                )
             list_var = self._resolve_param(action, mapping, "List", "ItemList")
 
             if list_var == "ItemList":
@@ -541,39 +558,23 @@ class PADScriptGenerator:
         mapping_lookup,
         all_actions,
     ):
-        """Generate a UiPath TryCatch using valid PAD BLOCK grammar.
+        """Generate UiPath TryCatch using flag-based PAD BLOCK grammar.
 
-        Normal structure:
-
-            BLOCK
-                ON BLOCK ERROR
-                    <catch actions>
-                END
-
-                <protected try actions>
-            END
-
-            <finally actions>
-
-        PAD rejects a nested ON BLOCK ERROR while already executing an error
-        handler. If a UiPath TryCatch occurs inside a catch body, the nested
-        protected actions are emitted directly and the nested catch actions are
-        preserved inside a disabled IF block for explicit manual review.
+        Designer-verified: ON BLOCK ERROR accepts only flat statements.
+        The handler raises a flag; catch logic runs afterwards in a normal
+        IF, which supports arbitrary nesting.
         """
-
         try_children = []
         catch_children = []
         finally_children = []
 
         def add_children(node, destination):
-            """Append direct children of a structural wrapper."""
             for child_id in node.get("child_ids", []):
                 child = self._get_action_by_id(child_id, all_actions)
                 if child:
                     destination.append(child)
 
         def classify_children(node):
-            """Classify descendants into try, catch, and finally sections."""
             for child_id in node.get("child_ids", []):
                 child = self._get_action_by_id(child_id, all_actions)
                 if not child:
@@ -601,7 +602,6 @@ class PADScriptGenerator:
                     add_children(child, catch_children)
                     continue
 
-                # Structural wrappers introduced by the XAML parser.
                 if (
                     child_type.startswith("Block_")
                     or child_type == "Container"
@@ -611,123 +611,115 @@ class PADScriptGenerator:
                     classify_children(child)
                     continue
 
-                # Any direct activity not under an explicit catch/finally wrapper
-                # belongs to the protected body.
                 try_children.append(child)
 
         classify_children(action)
 
-        # --------------------------------------------------------------
-        # Nested TryCatch inside an active PAD error handler
-        # --------------------------------------------------------------
-        if self._error_handler_depth > 0:
-            display_name = action.get("display_name", "Nested TryCatch")
+        # Record the entry indent so it can be restored no matter what
+        # the child generators do.
+        entry_indent = self.indent_level
 
-            self._add_comment(
-                f"MANUAL REVIEW: Nested TryCatch inside an active error "
-                f"handler: {display_name}"
-            )
-            self._add_comment(
-                "PAD cannot declare another ON BLOCK ERROR in this context."
-            )
+        error_flag = re.sub(
+            r"[^A-Za-z0-9_]",
+            "_",
+            f"BlockError_{action.get('action_id') or 'x'}",
+        )
 
-            # Emit the protected body so source actions are not silently lost.
-            if try_children:
-                self._add_comment("Nested protected body")
-                for child in try_children:
-                    self._generate_action(
-                        child,
-                        mapping_lookup,
-                        all_actions,
-                    )
-            else:
-                self._add_comment("Nested protected body is empty")
+        self._add_line(f"SET {error_flag} TO False")
+        self.generated_variables.add(error_flag)
 
-            # Do not run catch actions unconditionally. Keep them in the output
-            # under an explicit disabled branch for manual migration.
-            if catch_children:
-                self._add_comment(
-                    "Nested catch actions preserved below but disabled; "
-                    "manual exception-flow migration is required"
-                )
-                self._add_line('IF $"False" THEN')
-                self.indent_level += 1
-
-                for child in catch_children:
-                    self._generate_action(
-                        child,
-                        mapping_lookup,
-                        all_actions,
-                    )
-
-                self.indent_level -= 1
-                self._add_line("END")
-
-            # Finally actions must remain executable after the protected body.
-            if finally_children:
-                self._add_comment("Nested finally actions")
-                for child in finally_children:
-                    self._generate_action(
-                        child,
-                        mapping_lookup,
-                        all_actions,
-                    )
-
-            return
-
-        # --------------------------------------------------------------
-        # Normal top-level/non-nested TryCatch
-        # --------------------------------------------------------------
+        # ---- BLOCK ------------------------------------------------
         self._add_line("BLOCK")
-        self.indent_level += 1
+        self.indent_level = entry_indent + 1
 
-        # PAD requires the error declaration to be closed before the protected
-        # body is emitted.
+        # ---- ON BLOCK ERROR (exactly one flat statement) ----------
         self._add_line("ON BLOCK ERROR")
-        self.indent_level += 1
-        self._error_handler_depth += 1
-
-        try:
-            if catch_children:
-                for child in catch_children:
-                    self._generate_action(
-                        child,
-                        mapping_lookup,
-                        all_actions,
-                    )
-            else:
-                self._add_comment("No error handling defined")
-        finally:
-            self._error_handler_depth -= 1
-
-        # Close ON BLOCK ERROR.
-        self.indent_level -= 1
+        self.indent_level = entry_indent + 2
+        self._add_line(f"SET {error_flag} TO True")
+        self.indent_level = entry_indent + 1
         self._add_line("END")
 
-        # Protected body is outside the ON BLOCK ERROR section.
-        if try_children:
-            for child in try_children:
+        # ---- protected body ---------------------------------------
+        body_start = len(self.script_lines)
+
+        for child in try_children:
+            self._generate_action(
+                child,
+                mapping_lookup,
+                all_actions,
+            )
+
+        # Child generators must not leak indent changes.
+        self.indent_level = entry_indent + 1
+
+        executable_body = [
+            line
+            for line in self.script_lines[body_start:]
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+        if not executable_body:
+            placeholder_var = f"{error_flag}_Placeholder"
+
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "Protected block body has no executable PAD action "
+                    "because its source activities require manual "
+                    "migration; the catch logic below is unreachable "
+                    "until real actions are added here"
+                ),
+                suggested_pad_action="Block / On block error",
+                source_data={
+                    "TryActionCount": len(try_children),
+                    "CatchActionCount": len(catch_children),
+                    "PlaceholderVariable": placeholder_var,
+                },
+                required_work=(
+                    "Replace the placeholder SET below with the migrated "
+                    "business actions (see the review comments above)."
+                ),
+            )
+
+            self._add_line(
+                f"SET {placeholder_var} TO "
+                f"$'''Replace with migrated actions'''"
+            )
+            self.generated_variables.add(placeholder_var)
+
+        # ---- close BLOCK (always) ---------------------------------
+        self.indent_level = entry_indent
+        self._add_line("END")
+
+        # ---- catch logic outside the block ------------------------
+        if catch_children:
+            self._add_line(
+                f'IF $"%{error_flag}% = True" THEN'
+            )
+            self.indent_level = entry_indent + 1
+
+            for child in catch_children:
                 self._generate_action(
                     child,
                     mapping_lookup,
                     all_actions,
                 )
-        else:
-            self._add_comment("Empty try block")
 
-        # Close BLOCK.
-        self.indent_level -= 1
-        self._add_line("END")
+            self.indent_level = entry_indent
+            self._add_line("END")
 
-        # UiPath Finally runs after either successful or handled execution.
+        # ---- finally ----------------------------------------------
         if finally_children:
-            self._add_comment("Finally")
             for child in finally_children:
                 self._generate_action(
                     child,
                     mapping_lookup,
                     all_actions,
                 )
+
+        # Guarantee the caller sees the same indent it started with.
+        self.indent_level = entry_indent
                 
     def _generate_block(
         self,
@@ -750,13 +742,21 @@ class PADScriptGenerator:
         )
 
         if block_type == "StateMachine":
-            self._add_comment(f"STATE MACHINE: {display_name}")
-            self._add_comment(
-                "NOTE: PAD has no direct state-machine equivalent."
-            )
-            self._add_comment(
-                "States and transitions are preserved below for manual "
-                "conversion to a state-variable loop."
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "PAD has no state-machine container; states were "
+                    "flattened into sequential execution"
+                ),
+                suggested_pad_action=(
+                    "Loop with CurrentState variable and If branches"
+                ),
+                required_work=(
+                    "Re-wire states as a CurrentState loop. States "
+                    "currently run sequentially, which is NOT the "
+                    "source behavior."
+                ),
             )
             self._generate_children(
                 action,
@@ -795,9 +795,22 @@ class PADScriptGenerator:
             else:
                 translated_condition = "always"
 
-            self._add_comment(
-                f"--- TRANSITION: {display_name} | "
-                f"Condition: {translated_condition} ---"
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "State transition requires manual state-variable "
+                    "routing"
+                ),
+                suggested_pad_action="If condition plus Set CurrentState",
+                source_data={
+                    "Condition": condition or "unconditional",
+                    "TranslatedCondition": translated_condition,
+                },
+                required_work=(
+                    "Set CurrentState to the target state when this "
+                    "condition is true."
+                ),
             )
             self._generate_children(
                 action,
@@ -1074,6 +1087,25 @@ class PADScriptGenerator:
             safe_literal = raw_message.replace("'", "")
             translated_message = f"'{safe_literal}'"
 
+        # Bare identifiers joined by '+' mean variable wrapping failed;
+        # emitting them writes literal text like "A + B" to the log.
+        if re.search(
+            r"[A-Za-z_]\w*\s*\+\s*[A-Za-z_]\w*",
+            translated_message,
+        ):
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "Log message concatenation could not be resolved "
+                    "to PAD variables"
+                ),
+                source_data={"OriginalMessage": source_message},
+                required_work=(
+                    "Rebuild the message text using PAD variables."
+                ),
+            )
+            translated_message = "'MANUAL_Fix'"
         source_level = self._extract_file_log_level(
             action
         )
@@ -1137,6 +1169,26 @@ class PADScriptGenerator:
                     "$'''" + level_prefix + text_to_write + "'''"
                 )
 
+        # Final guard: bare identifiers joined by '+' survived translation
+        # and would be written to the log as literal text.
+        if re.search(
+            r"[A-Za-z_]\w*\s*\+\s*[A-Za-z_]\w*",
+            text_to_write,
+        ):
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "Log message concatenation could not be resolved "
+                    "to PAD variables"
+                ),
+                source_data={"OriginalMessage": source_message},
+                required_work=(
+                    "Rebuild the message text using PAD variables."
+                ),
+            )
+            text_to_write = "$'''MANUAL_Fix'''"
+
         # Exact ActionId, parameters and enum values verified from
         # pad_llm_schema.json.
         self._add_line(
@@ -1164,12 +1216,24 @@ class PADScriptGenerator:
         schema_entry = self.lookup_schema(target_action)
 
         if not schema_entry:
-            self._add_comment(f"TODO [REVIEW]: {display_name} - No PAD action found for '{target_action}' - manual migration required")
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=f"PAD schema action '{target_action}' was not found",
+                suggested_pad_action=target_action,
+                required_work="Select the closest PAD action and configure it manually.",
+            )
             return False
 
         template = schema_entry.get("RobinSyntaxTemplate", "")
         if not template:
-            self._add_comment(f"TODO [REVIEW]: {display_name} - Empty RobinSyntaxTemplate for '{target_action}' - manual migration required")
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=f"PAD schema action '{target_action}' has no Robin syntax template",
+                suggested_pad_action=target_action,
+                required_work="Create and configure this PAD action manually.",
+            )
             return False
 
         filled_line = self._fill_template(template, schema_entry, action, mapping)
@@ -1222,9 +1286,46 @@ class PADScriptGenerator:
         value = self._translate_expression(value)
         if re.fullmatch(r'[A-Za-z_]\w*', value):
             value = f"%{value}%"
+
+        # 'CatchException'/'SysException' are renamed source exception
+        # OBJECTS, not real PAD variables. The designer cannot resolve
+        # them during paste, which breaks the whole file.
+        if value.strip("%") in ("CatchException", "SysException"):
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "Source assigned the caught .NET exception object; "
+                    "PAD has no equivalent object assignment"
+                ),
+                suggested_pad_action=(
+                    "Capture error details in the Block's "
+                    "'On block error' configuration"
+                ),
+                source_data={
+                    "TargetVariable": var_name,
+                    "SourceObject": value.strip("%"),
+                },
+                required_work=(
+                    "Use the block error settings to capture the error "
+                    "message into a variable, then use that variable."
+                ),
+            )
+            value = "''"
+
         if self._is_untranslatable(value) or self._has_forbidden_vb(value):
             original = properties.get("Value", "") or expressions.get("Value", "")
-            self._add_comment(f"MANUAL FIX VALUE: {original}")
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason="Assignment expression could not be translated to PAD",
+                suggested_pad_action="Set variable",
+                source_data={
+                    "TargetVariable": var_name,
+                    "OriginalExpression": original,
+                },
+                required_work="Replace MANUAL_Fix with the equivalent PAD expression.",
+            )
             value = "'MANUAL_Fix'"
         self._ensure_variable(var_name)
 
@@ -1255,16 +1356,32 @@ class PADScriptGenerator:
         subflow_name = self._clean_subflow_name(subflow_name)
 
         entry = self._find_flow_run_schema()
-        self._add_comment(f"{display_name}")
 
         if entry:
             template = entry.get("RobinSyntaxTemplate", "")
-            filled = template.replace("''", f"'{subflow_name}'", 1)
-            self._add_line(filled)
-        else:
-            self._add_comment(
-                f"SUBFLOW CALL: {subflow_name} - add a 'Run desktop flow' action manually"
-            )
+            if template:
+                filled = template.replace(
+                    "''", f"'{subflow_name}'", 1
+                )
+                self._add_line(filled)
+                return
+
+        self._add_manual_review(
+            action=action,
+            mapping=mapping,
+            reason=(
+                "No schema-backed PAD subflow call could be generated"
+            ),
+            suggested_pad_action="Run desktop flow / Run subflow",
+            source_data={
+                "SubflowName": subflow_name,
+                "WorkflowFileName": workflow_file,
+            },
+            required_work=(
+                f"Create a call to '{subflow_name}' and map all "
+                "input/output/in-out arguments."
+            ),
+        )
 
     def _find_flow_run_schema(self):
         """Locate the schema action that runs another desktop flow."""
@@ -1302,18 +1419,52 @@ class PADScriptGenerator:
         else:
             message = f"'{display_name}'"
 
-        self._add_comment(f"{display_name}")
-        self._add_comment(f"THROW (no Robin equivalent - raise manually if needed): {message}")
-
+        self._add_manual_review(
+            action=action,
+            mapping=mapping,
+            reason="Throw/Rethrow has no direct Robin equivalent",
+            suggested_pad_action="Throw error / Terminate flow",
+            source_data={"ExceptionMessage": message},
+            required_work=(
+                "Create the PAD error action and preserve the original "
+                "termination behavior."
+            ),
+        )
     def _generate_comment_action(self, action, mapping):
         """Generate a comment line (includes notes so unmapped actions stay visible)."""
         properties = action.get("properties", {})
         text = properties.get("Text", "") or action.get("display_name", "Comment")
         notes = mapping.get("notes", "")
-        if notes:
-            self._add_comment(f"{text} - {notes}")
-        else:
-            self._add_comment(text)
+
+        manual_markers = (
+            "no pad equivalent",
+            "orchestrator",
+            "replace with",
+            "manual",
+            "unsupported",
+            "queue",
+            "transaction",
+            "credential",
+            "asset",
+        )
+
+        searchable = (
+            f"{mapping.get('source_action', '')} {notes}"
+        ).lower()
+
+        # Ordinary UiPath Comment activities are intentionally omitted.
+        if not any(m in searchable for m in manual_markers):
+            return
+
+        self._add_manual_review(
+            action=action,
+            mapping=mapping,
+            reason=notes or "No direct PAD equivalent is available",
+            required_work=(
+                "Choose a replacement strategy (work queue, Excel, "
+                "database, API) and build the PAD action."
+            ),
+        )
 
     def _generate_unmapped(self, action, mapping):
         """Generate placeholder for unmapped action."""
@@ -1322,12 +1473,15 @@ class PADScriptGenerator:
         notes = mapping.get("notes", "")
         confidence = mapping.get("confidence", "low")
 
-        self._add_comment(f"TODO [UNMAPPED]: {source_action} - {display_name}")
-        self._add_comment(f"  Confidence: {confidence}")
-        if notes:
-            self._add_comment(f"  Notes: {notes}")
-        self._add_comment(f"  Manual migration required for this action")
-
+        self._add_manual_review(
+            action=action,
+            mapping=mapping,
+            reason="No supported PAD action mapping is available",
+            details=f"Confidence={confidence}; Notes={notes}",
+            required_work=(
+                "Select and configure the closest PAD action manually."
+            ),
+        )
     # ------------------------------------------------------------------
     # Template filling
     # ------------------------------------------------------------------
@@ -1879,7 +2033,19 @@ class PADScriptGenerator:
             translated = self._translate_expression(condition)
             # Still contains .NET calls / placeholders -> not valid Robin
             if self._is_untranslatable(translated):
-                self._add_comment(f"MANUAL FIX CONDITION: {condition}")
+                self._add_manual_review(
+                    action=action,
+                    mapping=mapping,
+                    reason=(
+                        "Condition could not be translated; temporary "
+                        "True inserted"
+                    ),
+                    source_data={"OriginalCondition": condition},
+                    required_work=(
+                        "Recreate this condition in PAD syntax and "
+                        "replace True."
+                    ),
+                )
                 return "True"
             # Strip redundant outer parentheses (PAD paste is strict)
             while len(translated) > 2 and translated.startswith("(") and translated.endswith(")"):
@@ -2490,6 +2656,111 @@ class PADScriptGenerator:
                 out.append(f"{indent}# [AUTO-NEUTRALIZED - verify manually] {stripped}")
                 logger.warning(f"Lint neutralized invalid line: {stripped[:80]}")
         return "\n".join(out)
+
+    @staticmethod
+    def _remove_empty_structures(script):
+        """Iteratively drop IF/ELSE structures with no executable body.
+
+        Empty branches are a designer-paste risk and carry no behavior.
+        Iteration matters: removing an inner empty IF can leave an outer
+        structure empty on the next pass.
+        """
+        lines = script.split("\n")
+        changed = True
+
+        def is_noise(text):
+            # Comments carry manual-review information and must never be
+            # deleted. Only blank lines count as noise.
+            return not text
+
+        while changed:
+            changed = False
+            output = []
+            index = 0
+
+            while index < len(lines):
+                stripped = lines[index].strip()
+
+                # IF ... THEN followed (ignoring noise) directly by END
+                if (
+                    stripped.startswith("IF ")
+                    and stripped.endswith(" THEN")
+                ):
+                    lookahead = index + 1
+                    while (
+                        lookahead < len(lines)
+                        and is_noise(lines[lookahead].strip())
+                    ):
+                        lookahead += 1
+
+                    if (
+                        lookahead < len(lines)
+                        and lines[lookahead].strip() == "END"
+                    ):
+                        index = lookahead + 1
+                        changed = True
+                        continue
+
+                # ELSE followed directly by END -> drop the ELSE only
+                if stripped == "ELSE":
+                    lookahead = index + 1
+                    while (
+                        lookahead < len(lines)
+                        and is_noise(lines[lookahead].strip())
+                    ):
+                        lookahead += 1
+
+                    if (
+                        lookahead < len(lines)
+                        and lines[lookahead].strip() == "END"
+                    ):
+                        index += 1
+                        changed = True
+                        continue
+
+                output.append(lines[index])
+                index += 1
+
+            lines = output
+
+        return "\n".join(lines)
+    
+    @staticmethod
+    def _check_block_balance(script):
+        """Log an error if openers and END statements do not match."""
+        openers = 0
+        closers = 0
+
+        for line in script.split("\n"):
+            stripped = line.strip()
+
+            if stripped.startswith("#") or not stripped:
+                continue
+
+            if (
+                stripped == "BLOCK"
+                or stripped == "ON BLOCK ERROR"
+                or stripped.startswith("LOOP")
+                or stripped.startswith("SWITCH ")
+                or (
+                    stripped.startswith("IF ")
+                    and stripped.endswith(" THEN")
+                )
+            ):
+                openers += 1
+            elif stripped == "END":
+                closers += 1
+
+        if openers != closers:
+            logger.error(
+                "BLOCK BALANCE ERROR: %d openers vs %d END statements "
+                "- the script will not paste",
+                openers,
+                closers,
+            )
+            return False
+
+        return True
 
     def _is_valid_robin_line(self, stripped):
         if self.LINT_STRUCTURAL_RE.match(stripped):
