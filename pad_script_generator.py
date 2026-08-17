@@ -1346,8 +1346,18 @@ class PADScriptGenerator:
 
         action_name, template_params = self._parse_template(template)
 
-        filled_parts = [action_name]
+        # Terminate/kill-process actions must never run with a default
+        # ProcessId of 0 - that would target an invalid/system process.
+        action_id_lower = str(
+            schema_entry.get("ActionId") or ""
+        ).lower()
 
+        is_process_kill_action = (
+            "terminateprocess" in action_id_lower
+            or "killprocess" in action_id_lower
+        )
+
+        filled_parts = [action_name]
         for param_name, default_value in template_params:
             resolved_value = self._resolve_template_param(
                 param_name=param_name,
@@ -1358,7 +1368,30 @@ class PADScriptGenerator:
                 inputs=inputs,
             )
 
+            if (
+                is_process_kill_action
+                and param_name.lower() in ("processid", "processname")
+                and str(resolved_value).strip("'\"$ ") in ("0", "")
+            ):
+                self._add_manual_review(
+                    action=action,
+                    mapping=mapping,
+                    reason=(
+                        "Process Name Required - the source did not "
+                        "provide a resolvable process identifier"
+                    ),
+                    suggested_pad_action=schema_entry.get(
+                        "ActionId", ""
+                    ),
+                    required_work=(
+                        "Set the target process name/ID manually before "
+                        "running this action."
+                    ),
+                )
+                resolved_value = "$'''MANUAL_Fix'''"
+
             if isinstance(resolved_value, str):
+
                 if "+" in resolved_value:
                     tmp = re.sub(r'[^A-Za-z0-9_]', '_', f"Tmp_{param_name}_{len(self.script_lines)}")
                     self._add_line(f"SET {tmp} TO {self._pad_set_value(resolved_value)}")
@@ -1388,8 +1421,65 @@ class PADScriptGenerator:
                 inner = resolved_value[1:-1]
                 if inner:
                     resolved_value = "$'''" + inner + "'''"
-            filled_parts.append(f"{param_name}: {resolved_value}")
 
+            # Final per-parameter gates (issues: VB leakage, key tokens,
+            # concatenation inside $'''...''').
+            if isinstance(resolved_value, str):
+                # Normalize any surviving [k(enter)]/[k(%enter%)] tokens.
+                resolved_value = self._normalize_key_tokens(resolved_value)
+
+                # Mixed text + variables must be interpolated, never bare.
+                if (
+                    "%" in resolved_value
+                    and not resolved_value.startswith("$'''")
+                    and not re.fullmatch(r"%[A-Za-z_]\w*%", resolved_value)
+                    and not re.fullmatch(r"[A-Za-z_.]+", resolved_value)
+                ):
+                    resolved_value = self._pad_set_value(resolved_value)
+                    if re.fullmatch(r"[A-Za-z_]\w*", resolved_value):
+                        resolved_value = f"$'''%{resolved_value}%'''"
+                    elif not resolved_value.startswith("$"):
+                        resolved_value = "$'''" + resolved_value.strip("'") + "'''"
+
+                # Concatenation leaked inside an interpolated literal:
+                # $'''<td>' + %x% + '</td>''' -> re-merge through
+                # _pad_set_value.
+                if (
+                    resolved_value.startswith("$'''")
+                    and "' + " in resolved_value or " + '" in resolved_value
+                ) and resolved_value.startswith("$'''"):
+                    remerged = self._pad_set_value(
+                        resolved_value[4:-3]
+                    )
+                    if remerged.startswith("$'''"):
+                        resolved_value = remerged
+
+                # Hard gate: any remaining VB leakage in this parameter
+                # makes the whole action unpastable - use MANUAL_Fix and
+                # record the original for the developer.
+                if self._has_forbidden_vb(resolved_value):
+                    self._add_manual_review(
+                        action=action,
+                        mapping=mapping,
+                        reason=(
+                            f"Parameter '{param_name}' contains "
+                            "untranslated .NET syntax"
+                        ),
+                        suggested_pad_action=schema_entry.get(
+                            "ActionId", ""
+                        ),
+                        source_data={
+                            "Parameter": param_name,
+                            "OriginalValue": resolved_value,
+                        },
+                        required_work=(
+                            "Rebuild this value with PAD text actions "
+                            "and set it on the generated action."
+                        ),
+                    )
+                    resolved_value = "$'''MANUAL_Fix'''"
+
+            filled_parts.append(f"{param_name}: {resolved_value}")
         for output in outputs:
             out_name = output.get("Name", "")
             if isinstance(out_name, dict):
@@ -1809,7 +1899,19 @@ class PADScriptGenerator:
             translated = re.sub(r'%[A-Za-z_]\w*%', _bool_var, translated)
             return translated
 
-        return "<<PLACEHOLDER_Condition>>"
+        # No condition found in the source action - never emit a
+        # placeholder into an executable IF.
+        self._add_manual_review(
+            action=action,
+            mapping=mapping,
+            reason="Condition Required - no condition could be extracted from the source activity",
+            suggested_pad_action="PAD If condition",
+            required_work=(
+                "Determine the intended condition from the source XAML "
+                "and replace the temporary True condition."
+            ),
+        )
+        return "True"
     
     def _resolve_switch_value(self, action, mapping):
         """Resolve SWITCH value expression."""
@@ -1826,7 +1928,14 @@ class PADScriptGenerator:
         if value:
             return self._translate_expression(value)
 
-        return "<<PLACEHOLDER_SwitchValue>>"
+        self._add_manual_review(
+            action=action,
+            mapping=mapping,
+            reason="Switch value required - none could be extracted from the source activity",
+            suggested_pad_action="PAD Switch",
+            required_work="Set the switch expression from the source XAML.",
+        )
+        return "''"
 
     def _resolve_param(self, action, mapping, target_param, fallback):
         """Resolve a single parameter value from action and mapping."""
@@ -1890,8 +1999,12 @@ class PADScriptGenerator:
     def _is_untranslatable(text):
         """True if a translated expression still contains .NET constructs
         (function calls, member access, GetType, bare placeholders)."""
+        # Check MANUAL_ markers BEFORE stripping quotes - a quoted
+        # 'MANUAL_CurrentDateTime' literal is still untranslatable.
+        if "MANUAL_" in (text or ""):
+            return True
         stripped = re.sub(r"'[^']*'", "", text or "")
-        return bool(re.search(r"MANUAL_|\bGetType\b|\w+\(|\w+\.\w+", stripped))
+        return bool(re.search(r"\bGetType\b|\w+\(|\w+\.\w+", stripped))
     
     # Patterns that must never appear in emitted Robin values.
     FORBIDDEN_VB_PATTERNS = (
@@ -1910,8 +2023,15 @@ class PADScriptGenerator:
         r"row\s*\(\s*\"",
         r"\.Rows\s*\(",
         r"\.Item\s*\(",
-        r"'\s*\+\s*|\s*\+\s*'",   # quote-adjacent concatenation leakage
-        r"\[k\(%[^%]+%\)\]",       # key token wrongly variable-ized
+        r"'\s*\+\s*|\s*\+\s*'",
+        r"\[k\(%[^%]+%\)\]",
+        # Untranslatable placeholders that must never be executable:
+        r"MANUAL_CurrentDateTime",
+        r"MANUAL_Object",
+        r"MANUAL_Screen_",
+        r"\.DayOfWeek\b",
+        r"\.AddDays\b|\.AddMonths\b|\.AddYears\b",
+        r"<<PLACEHOLDER_[^>]*>>",
     )
 
     @classmethod
@@ -2510,10 +2630,21 @@ class PADScriptGenerator:
                 ):
                     continue
 
-                corrected_line = self._llm_fix_line(
-                    original_line,
-                    message,
-                )
+                # Deterministic repair first: rejected lines whose only
+                # defect is a malformed keyboard token.
+                corrected_line = None
+                if "[k(" in original_line.lower():
+                    normalized = self._normalize_key_tokens(
+                        original_line
+                    )
+                    if normalized.strip() != original_line.strip():
+                        corrected_line = normalized.strip()
+
+                if not corrected_line:
+                    corrected_line = self._llm_fix_line(
+                        original_line,
+                        message,
+                    )
 
                 indent = original_line[
                     :len(original_line) - len(original_line.lstrip())
