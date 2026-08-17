@@ -1,3 +1,9 @@
+'''log message -> write text to file
+SET variable: top of file, once ✅ (you got this right)
+Write text to file actions: NOT at the end — each one sits exactly where the original UiPath Log Message was in the flow. That's essential: a log saying "Started Process" must execute at the start, an error log must execute inside the error branch. Order = source order.
+Manual review comment: once per file, next to wherever the first log action happened to be — not at the end.'''
+
+
 import json
 import re
 import logging
@@ -1216,7 +1222,7 @@ class PADScriptGenerator:
         value = self._translate_expression(value)
         if re.fullmatch(r'[A-Za-z_]\w*', value):
             value = f"%{value}%"
-        if self._is_untranslatable(value):
+        if self._is_untranslatable(value) or self._has_forbidden_vb(value):
             original = properties.get("Value", "") or expressions.get("Value", "")
             self._add_comment(f"MANUAL FIX VALUE: {original}")
             value = "'MANUAL_Fix'"
@@ -1529,6 +1535,11 @@ class PADScriptGenerator:
             stashed.append(match.group(1))
             return f"\x00{len(stashed) - 1}\x00"
 
+        # Normalize and protect keyboard tokens FIRST so key names are
+        # never wrapped as %variables% by the identifier pass.
+        expr = self._normalize_key_tokens(expr)
+
+        
         expr = re.sub(r'"([^"]*)"', _stash, expr)
         expr = re.sub(r"'([^']*)'", _stash, expr)
 
@@ -1631,6 +1642,10 @@ class PADScriptGenerator:
         # Robin text literals use single quotes - never emit double quotes
         expr = expr.replace('""', "''")
 
+        # Final key-token normalization (covers tokens restored from
+        # stashed strings, e.g. "...[k(enter)]" inside quoted literals).
+        expr = self._normalize_key_tokens(expr)
+
         return expr.strip() if expr.strip() else "''"
     
     def _pad_set_value(self, value):
@@ -1642,8 +1657,11 @@ class PADScriptGenerator:
         if m:
             return m.group(1)
 
-        # Non-empty quoted literal -> designer-style $'''...'''
-        if len(v) >= 2 and v[0] == "'" and v[-1] == "'" and not v.startswith("$"):
+        # Non-empty SINGLE quoted literal -> designer-style $'''...'''
+        # Must be exactly one 'literal' - a concatenation like
+        # 'a' + %x% + 'b' also starts/ends with a quote and must NOT
+        # take this branch.
+        if re.fullmatch(r"'[^']*'", v):
             inner = v[1:-1]
             if inner:
                 return "$'''" + inner + "'''"
@@ -1659,13 +1677,27 @@ class PADScriptGenerator:
 
         if has_literal:
             out = []
+            leaked = False
             for p in parts:
                 p = p.strip()
                 if re.fullmatch(r"'[^']*'|\"[^\"]*\"", p):
                     out.append(p[1:-1])
-                elif p:
+                elif re.fullmatch(r"%[A-Za-z_]\w*%", p):
                     out.append(p)
-            inner = re.sub(r"  +", " ", " ".join(out)).strip()
+                elif re.fullmatch(r"[A-Za-z_]\w*", p):
+                    out.append(f"%{p}%")
+                elif p:
+                    # Unresolved VB (.Replace, calls, member access).
+                    # Merging it would leak raw VB into the literal.
+                    leaked = True
+                    break
+
+            if leaked or self._has_forbidden_vb("".join(out)):
+                return "$'''MANUAL_Fix'''"
+
+            # Join with no separator - literals carry their own spacing
+            # ('<td>' + %x% must become <td>%x%, not <td> %x%).
+            inner = "".join(out)
         else:
             numeric_parts = [p.strip() for p in parts if p.strip()]
 
@@ -1860,6 +1892,68 @@ class PADScriptGenerator:
         (function calls, member access, GetType, bare placeholders)."""
         stripped = re.sub(r"'[^']*'", "", text or "")
         return bool(re.search(r"MANUAL_|\bGetType\b|\w+\(|\w+\.\w+", stripped))
+    
+    # Patterns that must never appear in emitted Robin values.
+    FORBIDDEN_VB_PATTERNS = (
+        r"\.Replace\s*\(",
+        r"\.Substring\s*\(",
+        r"\.Split\s*\(",
+        r"\.Trim\s*\(",
+        r"\.ToUpper\b",
+        r"\.ToLower\b",
+        r"String\.Format\s*\(",
+        r"String\.Join\s*\(",
+        r"Environment\.NewLine",
+        r"DateTime\.",
+        r"CurrentDateTime\.",
+        r"vbCrLf|vbLf|vbTab",
+        r"row\s*\(\s*\"",
+        r"\.Rows\s*\(",
+        r"\.Item\s*\(",
+        r"'\s*\+\s*|\s*\+\s*'",   # quote-adjacent concatenation leakage
+        r"\[k\(%[^%]+%\)\]",       # key token wrongly variable-ized
+    )
+
+    @classmethod
+    def _has_forbidden_vb(cls, text):
+        """True if the value still contains VB/.NET leakage."""
+        if not text:
+            return False
+        return any(
+            re.search(p, text, flags=re.IGNORECASE)
+            for p in cls.FORBIDDEN_VB_PATTERNS
+        )
+        
+    _KEY_TOKEN_MAP = {
+        "enter": "ENTER", "tab": "TAB", "space": "SPACE",
+        "up": "UP", "down": "DOWN", "left": "LEFT", "right": "RIGHT",
+        "esc": "ESC", "escape": "ESC", "backspace": "BACKSPACE",
+        "delete": "DELETE", "del": "DELETE", "home": "HOME",
+        "end": "END", "pageup": "PAGEUP", "pagedown": "PAGEDOWN",
+        "f1": "F1", "f2": "F2", "f3": "F3", "f4": "F4", "f5": "F5",
+        "f6": "F6", "f7": "F7", "f8": "F8", "f9": "F9", "f10": "F10",
+        "f11": "F11", "f12": "F12",
+    }
+
+    @classmethod
+    def _normalize_key_tokens(cls, text):
+        """Normalize [k(enter)] to [k(ENTER)] and repair [k(%enter%)]."""
+        if not text or "[k(" not in text.lower():
+            return text
+
+        def fix(match):
+            key = match.group(1).strip().strip("%").lower()
+            mapped = cls._KEY_TOKEN_MAP.get(key)
+            if mapped:
+                return f"[k({mapped})]"
+            return f"[k({match.group(1).strip().strip('%')})]"
+
+        return re.sub(
+            r"\[\s*k\s*\(\s*([^)\]]+?)\s*\)\s*\]",
+            fix,
+            text,
+            flags=re.IGNORECASE,
+        )
 
     @staticmethod
     def _get_default_for_type(var_type, existing_default=""):
@@ -2252,6 +2346,23 @@ class PADScriptGenerator:
             # Robin strings are single-quoted only - never emit double quotes
             line = line.replace('""', "''")
             stripped = line.strip()
+
+            if self._has_forbidden_vb(stripped):
+                indent = line[: len(line) - len(line.lstrip())]
+                compact = re.sub(r"\s+", " ", stripped)[:300]
+                out.append(
+                    f"{indent}# [MANUAL REVIEW] "
+                    f"SourceId=generated_line | UiPathAction=Unknown | "
+                    f"Name=VB expression leakage | "
+                    f"SuggestedPAD=Rebuild value with PAD text actions | "
+                    f"Reason=Line contains untranslated .NET syntax | "
+                    f"SourceData=Original: {compact}"
+                )
+                logger.warning(
+                    "VB leakage neutralized: %s", stripped[:80]
+                )
+                continue
+
             if self._is_valid_robin_line(stripped):
                 out.append(line)
             else:
