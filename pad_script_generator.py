@@ -1503,6 +1503,84 @@ class PADScriptGenerator:
                 "Select and configure the closest PAD action manually."
             ),
         )
+        
+    def _derive_meaningful_variable_name(
+        self,
+        action,
+        param_name,
+    ):
+        """Build a business-meaningful variable name for a parameter.
+
+        Priority: UiPath DisplayName -> target parameter -> action id.
+        A generic Tmp_* name is only produced when nothing usable exists.
+        """
+        display_name = str(
+            action.get("display_name") or ""
+        ).strip()
+
+        # Words that describe the UiPath activity, not the business value.
+        noise_words = {
+            "type", "into", "click", "set", "get", "assign",
+            "enter", "input", "write", "read", "select",
+            "the", "a", "an", "to", "in", "on", "for", "of",
+            "with", "and", "or", "value", "field", "text",
+            "box", "button", "element", "ui", "web", "page",
+            "window", "screen", "activity", "step", "action",
+        }
+
+        words = [
+            word
+            for word in re.split(r"[^A-Za-z0-9]+", display_name)
+            if word and word.lower() not in noise_words
+        ]
+
+        if words:
+            base = "".join(
+                word[:1].upper() + word[1:]
+                for word in words[:4]
+            )
+        else:
+            base = ""
+
+        if not base:
+            # Fall back to the parameter's own name.
+            base = str(param_name or "").strip()
+
+        if not base:
+            base = "Value"
+
+        # Append the parameter role when it adds meaning.
+        param_clean = re.sub(
+            r"[^A-Za-z0-9]",
+            "",
+            str(param_name or ""),
+        )
+
+        if (
+            param_clean
+            and param_clean.lower() not in base.lower()
+            and param_clean.lower() not in ("text", "value")
+        ):
+            base = f"{base}{param_clean}"
+
+        candidate = re.sub(r"[^A-Za-z0-9_]", "", base)
+
+        if not candidate or not candidate[0].isalpha():
+            candidate = f"Var{candidate}"
+
+        candidate = candidate[:60]
+
+        # Guarantee uniqueness without losing readability.
+        if candidate in self.generated_variables:
+            action_id = re.sub(
+                r"[^A-Za-z0-9_]",
+                "_",
+                str(action.get("action_id") or "x"),
+            )
+            candidate = f"{candidate}_{action_id}"
+
+        return candidate
+    
     # ------------------------------------------------------------------
     # Template filling
     # ------------------------------------------------------------------
@@ -1568,57 +1646,99 @@ class PADScriptGenerator:
             if isinstance(resolved_value, str):
 
                 if "+" in resolved_value:
-                    # Try direct merge first. Only fall back to a temp
-                    # variable when the value genuinely cannot be
-                    # expressed as one interpolated literal.
                     merged = self._pad_set_value(resolved_value)
 
                     if (
                         merged.startswith("$'''")
                         and "MANUAL_Fix" not in merged
                     ):
-                        # Clean merge: "H35" + "[k(enter)]" becomes
-                        # $'''H35[k(ENTER)]''' with no temp variable.
-                        resolved_value = merged
-                    elif "MANUAL_Fix" in merged:
-                        # Untranslatable - record the original so the
-                        # developer sees what value is required.
-                        self._add_manual_review(
-                            action=action,
-                            mapping=mapping,
-                            reason=(
-                                f"Parameter '{param_name}' expression "
-                                "could not be translated to PAD"
-                            ),
-                            suggested_pad_action=schema_entry.get(
-                                "ActionId", ""
-                            ),
-                            source_data={
-                                "Parameter": param_name,
-                                "OriginalExpression": resolved_value,
-                            },
-                            required_work=(
-                                "Replace MANUAL_Fix with the value shown "
-                                "in OriginalExpression, rebuilt using PAD "
-                                "variables or text actions."
-                            ),
-                        )
+                        # Clean merge - no variable needed.
                         resolved_value = merged
                     else:
-                        # Genuine multi-step expression - keep the temp
-                        # variable but name it after the source action so
-                        # the developer can trace it.
-                        tmp = re.sub(
-                            r"[^A-Za-z0-9_]",
-                            "_",
-                            f"Tmp_{action.get('action_id', 'x')}"
-                            f"_{param_name}",
+                        # A variable assignment must precede the action.
+                        # Use a business-meaningful name, never Tmp_*.
+                        value_var = (
+                            self._derive_meaningful_variable_name(
+                                action,
+                                param_name,
+                            )
                         )
+
+                        source_expression = (
+                            action.get("properties", {}).get(param_name)
+                            or action.get("expressions", {}).get(
+                                param_name
+                            )
+                            or resolved_value
+                        )
+
+                        if "MANUAL_Fix" in merged:
+                            hint = ""
+                            expression_text = str(source_expression)
+
+                            if ".Replace(" in expression_text:
+                                hint = (
+                                    " Add a Text.Replace action before "
+                                    "this one and use its Result."
+                                )
+                            elif "String.Format(" in expression_text:
+                                hint = (
+                                    " Rebuild as interpolated PAD text "
+                                    "using %Variable% placeholders."
+                                )
+                            elif re.search(
+                                r"row\s*\(",
+                                expression_text,
+                                re.IGNORECASE,
+                            ):
+                                hint = (
+                                    " Read the column value into a "
+                                    "variable first."
+                                )
+
+                            self._add_manual_review(
+                                action=action,
+                                mapping=mapping,
+                                reason=(
+                                    f"Parameter '{param_name}' could not "
+                                    "be translated to PAD"
+                                ),
+                                suggested_pad_action=schema_entry.get(
+                                    "ActionId",
+                                    "",
+                                ),
+                                source_data={
+                                    "Variable": value_var,
+                                    "OriginalExpression": (
+                                        source_expression
+                                    ),
+                                },
+                                required_work=(
+                                    f"Set {value_var} to the PAD "
+                                    f"equivalent of the original "
+                                    f"expression.{hint}"
+                                ),
+                            )
+
+                        # Keep the source expression next to the
+                        # assignment so the value is visible in place.
+                        compact_expression = re.sub(
+                            r"\s+",
+                            " ",
+                            str(source_expression),
+                        )[:200]
+
                         self._add_line(
-                            f"SET {tmp} TO {merged}"
+                            f"# OriginalExpression: "
+                            f"{compact_expression}"
                         )
-                        self.generated_variables.add(tmp)
-                        resolved_value = f"$'''%{tmp}%'''"
+
+                        self._add_line(
+                            f"SET {value_var} TO {merged}"
+                        )
+
+                        self.generated_variables.add(value_var)
+                        resolved_value = f"$'''%{value_var}%'''"
                 else:
                     m = re.fullmatch(r"%([A-Za-z_]\w*)%", resolved_value)
                     if m:
