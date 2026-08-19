@@ -1652,11 +1652,8 @@ class PADScriptGenerator:
                         merged.startswith("$'''")
                         and "MANUAL_Fix" not in merged
                     ):
-                        # Clean merge - no variable needed.
                         resolved_value = merged
                     else:
-                        # A variable assignment must precede the action.
-                        # Use a business-meaningful name, never Tmp_*.
                         value_var = (
                             self._derive_meaningful_variable_name(
                                 action,
@@ -1720,8 +1717,6 @@ class PADScriptGenerator:
                                 ),
                             )
 
-                        # Keep the source expression next to the
-                        # assignment so the value is visible in place.
                         compact_expression = re.sub(
                             r"\s+",
                             " ",
@@ -1740,22 +1735,163 @@ class PADScriptGenerator:
                         self.generated_variables.add(value_var)
                         resolved_value = f"$'''%{value_var}%'''"
                 else:
-                    m = re.fullmatch(r"%([A-Za-z_]\w*)%", resolved_value)
+                    m = re.fullmatch(
+                        r"%([A-Za-z_]\w*)%",
+                        resolved_value,
+                    )
+
                     if m:
-                        # Named parameters only accept literals or interpolated
-                        # strings - a bare variable was never proven to paste.
                         resolved_value = f"$'''%{m.group(1)}%'''"
                     elif re.fullmatch(r"Var\w+", resolved_value):
                         if resolved_value not in self.generated_variables:
-                            self._add_line(f"SET {resolved_value} TO ''")
+                            self._add_line(
+                                f"SET {resolved_value} TO ''"
+                            )
                             self.generated_variables.add(resolved_value)
-                        # Object handles stay bare (schema style: Instance: VarInstance)
 
-                # LLM fill for unresolved schema placeholders
+                # LLM fill for unresolved schema placeholders.
                 if resolved_value.startswith("<<PLACEHOLDER"):
-                    llm_val = self._llm_fill_param(param_name, schema_entry, action)
+                    llm_val = self._llm_fill_param(
+                        param_name,
+                        schema_entry,
+                        action,
+                    )
+
                     if llm_val:
                         resolved_value = llm_val
+
+                # A placeholder must never survive - it would make the
+                # lint gate neutralize the whole action into a comment.
+                if resolved_value.startswith("<<PLACEHOLDER"):
+                    input_type = ""
+
+                    for input_definition in inputs:
+                        if input_definition.get("Name") == param_name:
+                            input_type = str(
+                                input_definition.get("Type") or ""
+                            )
+                            break
+
+                    type_lower = input_type.lower()
+                    name_lower = param_name.lower()
+
+                    is_element = (
+                        "element" in type_lower
+                        or "element" in name_lower
+                        or "control" in type_lower
+                    )
+
+                    if is_element:
+                        element_var = re.sub(
+                            r"[^A-Za-z0-9_]",
+                            "_",
+                            f"UIElement_{action.get('action_id', 'x')}",
+                        )
+
+                        if element_var not in self.generated_variables:
+                            self._add_line(
+                                f"SET {element_var} TO ''"
+                            )
+                            self.generated_variables.add(element_var)
+
+                        self._add_manual_review(
+                            action=action,
+                            mapping=mapping,
+                            reason=(
+                                "UiPath selectors cannot be converted to "
+                                "PAD UI elements"
+                            ),
+                            suggested_pad_action=schema_entry.get(
+                                "ActionId",
+                                "",
+                            ),
+                            source_data={
+                                "Parameter": param_name,
+                                "UiPathSelector": action.get("selector"),
+                                "ElementVariable": element_var,
+                            },
+                            required_work=(
+                                "Capture the target UI element in the PAD "
+                                "designer and attach it to this action."
+                            ),
+                        )
+
+                        resolved_value = element_var
+
+                    elif "bool" in type_lower:
+                        resolved_value = "False"
+                    elif (
+                        "int" in type_lower
+                        or "double" in type_lower
+                        or "decimal" in type_lower
+                    ):
+                        resolved_value = "0"
+                    else:
+                        resolved_value = "''"
+
+                # Value parameters are exposed as a named variable so the
+                # developer sets the value in one place, exactly as UiPath
+                # assigned it before the activity.
+                is_value_param = param_name.lower() in (
+                    "text",
+                    "texttowrite",
+                    "textvalue",
+                    "value",
+                    "inputtext",
+                    "content",
+                )
+
+                already_variable = bool(
+                    re.fullmatch(
+                        r"\$'''%[A-Za-z_]\w*%'''",
+                        resolved_value,
+                    )
+                )
+
+                needs_named_variable = (
+                    is_value_param
+                    and not already_variable
+                    and resolved_value not in ("''", "")
+                )
+
+                if needs_named_variable:
+                    value_var = (
+                        self._derive_meaningful_variable_name(
+                            action,
+                            param_name,
+                        )
+                    )
+
+                    source_expression = (
+                        action.get("properties", {}).get(param_name)
+                        or action.get("expressions", {}).get(param_name)
+                        or action.get("properties", {}).get("Text")
+                        or action.get("expressions", {}).get("Text")
+                        or ""
+                    )
+
+                    if source_expression:
+                        compact_expression = re.sub(
+                            r"\s+",
+                            " ",
+                            str(source_expression),
+                        )[:200]
+
+                        self._add_line(
+                            f"# OriginalExpression: "
+                            f"{compact_expression}"
+                        )
+
+                    assignment_value = self._pad_set_value(
+                        resolved_value
+                    )
+
+                    self._add_line(
+                        f"SET {value_var} TO {assignment_value}"
+                    )
+
+                    self.generated_variables.add(value_var)
+                    resolved_value = f"$'''%{value_var}%'''"
 
             # PAD designer emits text as $'''...''' - match it for non-empty strings
             if isinstance(resolved_value, str) and len(resolved_value) >= 2 \
@@ -2837,6 +2973,33 @@ class PADScriptGenerator:
             # Robin strings are single-quoted only - never emit double quotes
             line = line.replace('""', "''")
             stripped = line.strip()
+
+            # Documentation comments intentionally carry the original
+            # VB expression - they must never be neutralized.
+            if stripped.startswith("# OriginalExpression:"):
+                out.append(line)
+                continue
+
+            # A schema-backed action must survive even if one parameter
+            # value still needs manual work. Neutralizing the whole line
+            # would delete the action the developer needs.
+            action_match = re.match(
+                r"^([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+)",
+                stripped,
+            )
+
+            is_known_action = bool(
+                action_match
+                and action_match.group(1) in self.pad_schema_index
+            )
+
+            if is_known_action and self._has_forbidden_vb(stripped):
+                logger.warning(
+                    "Action retained despite unresolved value: %s",
+                    stripped[:80],
+                )
+                out.append(line)
+                continue
 
             if self._has_forbidden_vb(stripped):
                 indent = line[: len(line) - len(line.lstrip())]
