@@ -1314,19 +1314,40 @@ class PADScriptGenerator:
             value = "''"
 
         if self._is_untranslatable(value) or self._has_forbidden_vb(value):
-            original = properties.get("Value", "") or expressions.get("Value", "")
-            self._add_manual_review(
-                action=action,
-                mapping=mapping,
-                reason="Assignment expression could not be translated to PAD",
-                suggested_pad_action="Set variable",
-                source_data={
-                    "TargetVariable": var_name,
-                    "OriginalExpression": original,
-                },
-                required_work="Replace MANUAL_Fix with the equivalent PAD expression.",
+            original = (
+                properties.get("Value", "")
+                or expressions.get("Value", "")
+                or expressions.get("expression_0", "")
             )
-            value = "'MANUAL_Fix'"
+
+            # If the source value is a plain quoted literal, no manual
+            # work is needed - use it directly.
+            literal_match = re.fullmatch(
+                r"\[?\s*[\"']([^\"']*)[\"']\s*\]?",
+                str(original).strip(),
+            )
+
+            if literal_match:
+                value = f"'{literal_match.group(1)}'"
+            else:
+                self._add_manual_review(
+                    action=action,
+                    mapping=mapping,
+                    reason=(
+                        "Assignment expression could not be translated "
+                        "to PAD"
+                    ),
+                    suggested_pad_action="Set variable",
+                    source_data={
+                        "TargetVariable": var_name,
+                        "RequiredValue": original,
+                    },
+                    required_work=(
+                        f"Replace MANUAL_Fix with the PAD equivalent of: "
+                        f"{original}"
+                    ),
+                )
+                value = "'MANUAL_Fix'"
         self._ensure_variable(var_name)
 
         self._add_line(f"SET {var_name} TO {self._pad_set_value(value)}")
@@ -1547,9 +1568,57 @@ class PADScriptGenerator:
             if isinstance(resolved_value, str):
 
                 if "+" in resolved_value:
-                    tmp = re.sub(r'[^A-Za-z0-9_]', '_', f"Tmp_{param_name}_{len(self.script_lines)}")
-                    self._add_line(f"SET {tmp} TO {self._pad_set_value(resolved_value)}")
-                    resolved_value = f"$'''%{tmp}%'''"
+                    # Try direct merge first. Only fall back to a temp
+                    # variable when the value genuinely cannot be
+                    # expressed as one interpolated literal.
+                    merged = self._pad_set_value(resolved_value)
+
+                    if (
+                        merged.startswith("$'''")
+                        and "MANUAL_Fix" not in merged
+                    ):
+                        # Clean merge: "H35" + "[k(enter)]" becomes
+                        # $'''H35[k(ENTER)]''' with no temp variable.
+                        resolved_value = merged
+                    elif "MANUAL_Fix" in merged:
+                        # Untranslatable - record the original so the
+                        # developer sees what value is required.
+                        self._add_manual_review(
+                            action=action,
+                            mapping=mapping,
+                            reason=(
+                                f"Parameter '{param_name}' expression "
+                                "could not be translated to PAD"
+                            ),
+                            suggested_pad_action=schema_entry.get(
+                                "ActionId", ""
+                            ),
+                            source_data={
+                                "Parameter": param_name,
+                                "OriginalExpression": resolved_value,
+                            },
+                            required_work=(
+                                "Replace MANUAL_Fix with the value shown "
+                                "in OriginalExpression, rebuilt using PAD "
+                                "variables or text actions."
+                            ),
+                        )
+                        resolved_value = merged
+                    else:
+                        # Genuine multi-step expression - keep the temp
+                        # variable but name it after the source action so
+                        # the developer can trace it.
+                        tmp = re.sub(
+                            r"[^A-Za-z0-9_]",
+                            "_",
+                            f"Tmp_{action.get('action_id', 'x')}"
+                            f"_{param_name}",
+                        )
+                        self._add_line(
+                            f"SET {tmp} TO {merged}"
+                        )
+                        self.generated_variables.add(tmp)
+                        resolved_value = f"$'''%{tmp}%'''"
                 else:
                     m = re.fullmatch(r"%([A-Za-z_]\w*)%", resolved_value)
                     if m:
@@ -1998,9 +2067,25 @@ class PADScriptGenerator:
         if value.startswith("%") and value.endswith("%"):
             return value
 
-        # Simple identifier - treat as variable
+        # A bare identifier is only a variable reference when the source
+        # actually declared it. UiPath literals like
+        # "HX_POST_VERIFICATION_BU_BPS" or Excel cell refs like "H35"
+        # must stay literal text, not become phantom %variables%.
         if re.match(r'^[A-Za-z_]\w*$', value):
-            return f"%{value}%"
+            known_variable = (
+                value in self.generated_variables
+                or self._safe_var(value) in self.generated_variables
+            )
+
+            # Excel-style cell references (H35, AB12) are always literals.
+            is_cell_reference = bool(
+                re.fullmatch(r"[A-Z]{1,3}\d{1,7}", value)
+            )
+
+            if known_variable and not is_cell_reference:
+                return f"%{value}%"
+
+            return f"'{value}'"
 
         # Expression
         if any(c in value for c in ('+', '&', '(', ')', '.')):
