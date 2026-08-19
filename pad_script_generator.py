@@ -130,6 +130,7 @@ class PADScriptGenerator:
             self._emitted = set()
             self._manual_review_comments = {}
             self._error_handler_depth = 0
+            self._ui_context_emitted = set()
 
             if "workflows" in ir_data:
                 for idx, workflow in enumerate(ir_data["workflows"]):
@@ -210,6 +211,14 @@ class PADScriptGenerator:
             var_type = var.get("type", "General")
             default_value = self._get_default_for_type(var_type, default)
             safe = self._safe_var(name)
+
+            source_type = var.get("type", "")
+
+            if source_type and source_type != "General":
+                self._add_line(
+                    f"# Variable Type: {source_type}"
+                )
+
             self._add_line(f"SET {safe} TO {default_value}")
             self.generated_variables.add(safe)
 
@@ -1916,6 +1925,27 @@ class PADScriptGenerator:
             source_data={
                 "SubflowName": subflow_name,
                 "WorkflowFileName": workflow_file,
+                "Inputs": [
+                    name
+                    for name, info in (
+                        properties.get("InvokeArguments", {}) or {}
+                    ).items()
+                    if "InArgument" in info.get("direction", "")
+                ],
+                "Outputs": [
+                    name
+                    for name, info in (
+                        properties.get("InvokeArguments", {}) or {}
+                    ).items()
+                    if "OutArgument" in info.get("direction", "")
+                ],
+                "InOuts": [
+                    name
+                    for name, info in (
+                        properties.get("InvokeArguments", {}) or {}
+                    ).items()
+                    if "InOutArgument" in info.get("direction", "")
+                ],
             },
             required_work=(
                 f"Create a call to '{subflow_name}' and map all "
@@ -2022,6 +2052,76 @@ class PADScriptGenerator:
                 "Select and configure the closest PAD action manually."
             ),
         )
+    
+    def _emit_ui_context_comments(self, action):
+        """Preserve the UiPath selector and browser source in the output.
+
+        Lets the developer identify the target element and browser
+        without opening the original XAML.
+        """
+        action_id = action.get("action_id")
+
+        if not hasattr(self, "_ui_context_emitted"):
+            self._ui_context_emitted = set()
+
+        if action_id in self._ui_context_emitted:
+            return
+
+        self._ui_context_emitted.add(action_id)
+
+        selector = action.get("selector")
+
+        if selector:
+            self._add_line("# UI ELEMENT CAPTURE REQUIRED")
+            self._add_line(
+                "# Original Selector: "
+                + re.sub(r"\s+", " ", str(selector))[:250]
+            )
+
+        searchable = (
+            str(action.get("_inherited_context") or "")
+            + " "
+            + str(action.get("target_app") or "")
+        ).lower()
+
+        browser_markers = (
+            "openbrowser",
+            "attachbrowser",
+            "browser",
+            "chrome",
+            "msedge",
+            "firefox",
+            "iexplore",
+        )
+
+        if any(marker in searchable for marker in browser_markers):
+            properties = action.get("properties", {}) or {}
+
+            self._add_line("# BROWSER MAPPING REQUIRED")
+            self._add_line(
+                "# Source Activity: "
+                + str(action.get("action_type") or "Browser scope")
+            )
+            self._add_line(
+                "# Browser Type: "
+                + str(
+                    properties.get("BrowserType")
+                    or action.get("target_app")
+                    or "Unknown"
+                )
+            )
+
+            url = (
+                properties.get("Url")
+                or properties.get("BrowserUrl")
+                or ""
+            )
+
+            if url:
+                self._add_line(
+                    "# URL: "
+                    + re.sub(r"\s+", " ", str(url))[:200]
+                )
         
     def _derive_meaningful_variable_name(
         self,
@@ -2274,6 +2374,22 @@ class PADScriptGenerator:
                     if m:
                         resolved_value = f"$'''%{m.group(1)}%'''"
                     elif re.fullmatch(r"Var\w+", resolved_value):
+                        param_lower = param_name.lower()
+
+                        needs_context = any(
+                            token in param_lower
+                            for token in (
+                                "element",
+                                "field",
+                                "control",
+                                "window",
+                                "browser",
+                            )
+                        )
+
+                        if needs_context:
+                            self._emit_ui_context_comments(action)
+
                         if resolved_value not in self.generated_variables:
                             self._add_line(
                                 f"SET {resolved_value} TO ''"
@@ -2313,6 +2429,8 @@ class PADScriptGenerator:
                     )
 
                     if is_element:
+                        self._emit_ui_context_comments(action)
+
                         element_var = re.sub(
                             r"[^A-Za-z0-9_]",
                             "_",
@@ -2489,7 +2607,7 @@ class PADScriptGenerator:
                     )
                     resolved_value = "$'''MANUAL_Fix'''"
 
-                filled_parts.append(f"{param_name}: {resolved_value}")
+            filled_parts.append(f"{param_name}: {resolved_value}")
 
         for output in outputs:
             out_name = output.get("Name", "")

@@ -532,6 +532,42 @@ class XAMLParser:
                 continue
             properties[clean_key] = value
 
+        # InvokeWorkflowFile argument bindings live in a child
+        # dictionary and are lost by generic property extraction.
+        if "InvokeWorkflowFile" in self._clean_tag(element.tag):
+            invoke_arguments = {}
+
+            for child in element:
+                if "Arguments" not in self._clean_tag(child.tag):
+                    continue
+
+                for argument in child:
+                    key = (
+                        argument.get(
+                            f"{{{NAMESPACES['x']}}}Key"
+                        )
+                        or argument.get("Key")
+                        or ""
+                    )
+
+                    if not key:
+                        continue
+
+                    direction = self._clean_tag(argument.tag)
+
+                    value = (
+                        (argument.text or "").strip()
+                        or argument.get("ExpressionText", "")
+                    )
+
+                    invoke_arguments[key] = {
+                        "direction": direction,
+                        "value": value,
+                    }
+
+            if invoke_arguments:
+                properties["InvokeArguments"] = invoke_arguments
+        
         # Child property elements (e.g., Assign.To, Assign.Value)
         for child in element:
             child_tag = self._clean_tag(child.tag)
