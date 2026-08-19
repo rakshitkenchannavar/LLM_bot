@@ -308,7 +308,40 @@ class PADScriptGenerator:
                 mapping,
             )
             return
-        
+
+        # UiPath Excel scopes become launch + children + close in PAD.
+        if action_type in (
+            "ExcelApplicationScope",
+            "ExcelProcessScope",
+        ):
+            self._generate_excel_scope(
+                action,
+                mapping,
+                mapping_lookup,
+                all_actions,
+            )
+            return
+
+        # Excel read/write activities need worksheet activation and
+        # range coordinates, which the generic template path cannot
+        # supply.
+        if action_type in (
+            "ReadRange",
+            "ReadCell",
+            "ReadColumn",
+            "WriteRange",
+            "WriteCell",
+            "AppendRange",
+            "SaveWorkbook",
+        ):
+            if self._generate_excel_activity(action, mapping):
+                self._generate_children(
+                    action,
+                    mapping_lookup,
+                    all_actions,
+                )
+                return
+
         # Source-type guarantee: Throw/Rethrow always become THROW ERROR
         if action_type in ("Throw", "Rethrow"):
             self._generate_throw(action, mapping)
@@ -1199,6 +1232,492 @@ class PADScriptGenerator:
             "IfFileExists: File.IfFileExists.Append "
             f"TextToWrite: {text_to_write}"
         )
+    
+    @staticmethod
+    def _parse_excel_range(range_text):
+        """Parse A1 notation into start/end column and row.
+
+        'A1:D50' -> A,1,D,50   'B7' -> B,7,B,7   '' -> None
+        """
+        text = str(range_text or "").strip().strip("'\"[] ")
+
+        if not text:
+            return None
+
+        match = re.fullmatch(
+            r"([A-Za-z]{1,3})(\d{1,7})"
+            r"(?::([A-Za-z]{1,3})(\d{1,7}))?",
+            text,
+        )
+
+        if not match:
+            return None
+
+        return {
+            "start_column": match.group(1).upper(),
+            "start_row": int(match.group(2)),
+            "end_column": (
+                match.group(3) or match.group(1)
+            ).upper(),
+            "end_row": int(
+                match.group(4) or match.group(2)
+            ),
+            "is_single_cell": match.group(3) is None,
+        }
+
+    def _emit_worksheet_activation(
+        self,
+        action,
+        mapping,
+        instance_var,
+        sheet_name,
+    ):
+        """Activate the target worksheet before a read or write.
+
+        PAD read/write actions operate on the active sheet, so the
+        UiPath SheetName must become a separate activation action.
+        """
+        if not sheet_name:
+            return
+
+        activate_id = (
+            "Excel.SetActiveWorksheet.ActivateWorksheetByName"
+        )
+
+        if activate_id not in self.pad_schema_index:
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "No worksheet activation action in the PAD schema; "
+                    "the read/write below uses the active sheet"
+                ),
+                suggested_pad_action="Set active worksheet",
+                source_data={"SheetName": sheet_name},
+                required_work=(
+                    "Activate the correct worksheet before this action."
+                ),
+            )
+            return
+
+        sheet_value = self._pad_set_value(
+            self._translate_expression(str(sheet_name))
+        )
+
+        if "MANUAL_Fix" in sheet_value:
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "Worksheet name expression could not be translated"
+                ),
+                suggested_pad_action=activate_id,
+                source_data={"SheetName": sheet_name},
+                required_work=(
+                    "Set the worksheet name on the activation action."
+                ),
+            )
+
+        self._add_line(
+            f"{activate_id} "
+            f"Instance: {instance_var} "
+            f"Name: {sheet_value}"
+        )
+
+    def _resolve_excel_output_variable(
+        self,
+        action,
+        fallback_prefix,
+    ):
+        """Pick the variable that should receive an Excel read result."""
+        properties = action.get("properties", {}) or {}
+        expressions = action.get("expressions", {}) or {}
+
+        target = (
+            properties.get("DataTable")
+            or expressions.get("DataTable")
+            or properties.get("Result")
+            or expressions.get("Result")
+            or properties.get("Output")
+            or expressions.get("Output")
+            or properties.get("Value")
+            or ""
+        )
+
+        if target:
+            cleaned = self._clean_variable_name(target)
+
+            if cleaned:
+                self._ensure_variable(cleaned)
+                return cleaned
+
+        generated = re.sub(
+            r"[^A-Za-z0-9_]",
+            "_",
+            f"{fallback_prefix}_{action.get('action_id', 'x')}",
+        )
+
+        self._ensure_variable(generated)
+        return generated
+    
+    def _generate_excel_scope(
+        self,
+        action,
+        mapping,
+        mapping_lookup,
+        all_actions,
+    ):
+        """Open Excel, run scoped children, then close it.
+
+        UiPath's Excel scope becomes three PAD actions. The instance
+        capture syntax (Instance=> Var) is designer-verified, even though
+        the schema records no Outputs for these actions.
+        """
+        properties = action.get("properties", {}) or {}
+        expressions = action.get("expressions", {}) or {}
+
+        workbook_path = (
+            properties.get("WorkbookPath")
+            or expressions.get("WorkbookPath")
+            or ""
+        )
+
+        if not self.lookup_schema("Excel.LaunchExcel.LaunchAndOpen"):
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "No Excel launch action found in the PAD schema"
+                ),
+                suggested_pad_action="Launch Excel",
+                source_data={"WorkbookPath": workbook_path},
+                required_work=(
+                    "Open the workbook manually before the child "
+                    "actions below."
+                ),
+            )
+            self._generate_children(
+                action,
+                mapping_lookup,
+                all_actions,
+            )
+            return
+
+        instance_var = re.sub(
+            r"[^A-Za-z0-9_]",
+            "_",
+            f"ExcelInstance_{action.get('action_id', 'x')}",
+        )
+
+        if workbook_path:
+            translated_path = self._translate_expression(
+                workbook_path
+            )
+            path_value = self._pad_set_value(translated_path)
+
+            self._add_line(
+                "# OriginalExpression: "
+                + re.sub(r"\s+", " ", str(workbook_path))[:200]
+            )
+        else:
+            path_value = "$'''MANUAL_Fix'''"
+
+        if "MANUAL_Fix" in path_value:
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "Workbook path could not be translated to PAD"
+                ),
+                suggested_pad_action=(
+                    "Excel.LaunchExcel.LaunchAndOpen"
+                ),
+                source_data={"WorkbookPath": workbook_path},
+                required_work=(
+                    "Set the workbook path on the Launch Excel action."
+                ),
+            )
+
+        # Designer-verified: Instance=> captures the workbook handle.
+        self._add_line(
+            "Excel.LaunchExcel.LaunchAndOpen "
+            "LoadAddInsAndMacros: False "
+            "UseMachineLocale: False "
+            f"Path: {path_value} "
+            "ReadOnly: False "
+            "Visible: False "
+            f"Instance=> {instance_var}"
+        )
+        self.generated_variables.add(instance_var)
+
+        previous_instance = getattr(
+            self,
+            "_active_excel_instance",
+            None,
+        )
+        self._active_excel_instance = instance_var
+
+        try:
+            self._generate_children(
+                action,
+                mapping_lookup,
+                all_actions,
+            )
+        finally:
+            self._active_excel_instance = previous_instance
+
+        if self.lookup_schema("Excel.CloseExcel.Close"):
+            self._add_line(
+                f"Excel.CloseExcel.Close Instance: {instance_var}"
+            )
+
+    def _generate_excel_activity(self, action, mapping):
+        """Generate a PAD Excel read/write/save with sheet and range.
+
+        Returns True when an action was emitted, False to fall back to
+        the generic schema path.
+        """
+        instance_var = getattr(
+            self,
+            "_active_excel_instance",
+            None,
+        )
+
+        if not instance_var:
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "Excel activity is not inside a workbook scope, so "
+                    "no PAD Excel instance is available"
+                ),
+                suggested_pad_action="Launch Excel",
+                required_work=(
+                    "Add a Launch Excel action and reference its "
+                    "instance in this action."
+                ),
+            )
+            return False
+
+        properties = action.get("properties", {}) or {}
+        expressions = action.get("expressions", {}) or {}
+
+        action_type = re.sub(
+            r"[^a-z]",
+            "",
+            str(action.get("action_type") or "").lower(),
+        )
+
+        sheet_name = (
+            properties.get("SheetName")
+            or expressions.get("SheetName")
+            or ""
+        )
+
+        self._emit_worksheet_activation(
+            action=action,
+            mapping=mapping,
+            instance_var=instance_var,
+            sheet_name=sheet_name,
+        )
+
+        cell_range = (
+            properties.get("Range")
+            or expressions.get("Range")
+            or ""
+        )
+
+        parsed_range = self._parse_excel_range(cell_range)
+
+        if cell_range and not parsed_range:
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "Excel range is a dynamic expression and could not "
+                    "be converted to fixed coordinates"
+                ),
+                suggested_pad_action="Excel read/write with coordinates",
+                source_data={"Range": cell_range},
+                required_work=(
+                    "Set the start and end coordinates manually."
+                ),
+            )
+
+        add_headers = str(
+            properties.get("AddHeaders")
+            or properties.get("FirstLineIsHeader")
+            or "False"
+        ).strip().lower() in ("true", "1")
+
+        header_flag = "True" if add_headers else "False"
+
+        contents_mode = (
+            "GetCellContentsMode: "
+            "Excel.GetCellContentsMode.TypedValues"
+        )
+
+        # ----------------------------------------------------------
+        # READ
+        # ----------------------------------------------------------
+        if action_type in ("readrange", "readcell", "readcolumn"):
+            output_var = self._resolve_excel_output_variable(
+                action,
+                "ExcelData",
+            )
+
+            if parsed_range and parsed_range["is_single_cell"]:
+                self._add_line(
+                    "Excel.ReadFromExcel.ReadCell "
+                    f"Instance: {instance_var} "
+                    f"{contents_mode} "
+                    f"StartColumn: $'''{parsed_range['start_column']}''' "
+                    f"StartRow: {parsed_range['start_row']} "
+                    f"CellValue=> {output_var}"
+                )
+                return True
+
+            if parsed_range:
+                self._add_line(
+                    "Excel.ReadFromExcel.ReadCells "
+                    f"EndColumn: $'''{parsed_range['end_column']}''' "
+                    f"EndRow: {parsed_range['end_row']} "
+                    f"FirstLineIsHeader: {header_flag} "
+                    f"Instance: {instance_var} "
+                    f"{contents_mode} "
+                    f"StartColumn: $'''{parsed_range['start_column']}''' "
+                    f"StartRow: {parsed_range['start_row']} "
+                    f"ExcelData=> {output_var}"
+                )
+                return True
+
+            self._add_line(
+                "Excel.ReadFromExcel.ReadAllCells "
+                f"FirstLineIsHeader: {header_flag} "
+                f"Instance: {instance_var} "
+                f"{contents_mode} "
+                f"ExcelData=> {output_var}"
+            )
+            return True
+
+        # ----------------------------------------------------------
+        # WRITE
+        # ----------------------------------------------------------
+        if action_type in ("writerange", "writecell"):
+            source_value = (
+                properties.get("DataTable")
+                or expressions.get("DataTable")
+                or properties.get("Text")
+                or expressions.get("Text")
+                or properties.get("Value")
+                or expressions.get("Value")
+                or ""
+            )
+
+            if source_value:
+                self._add_line(
+                    "# OriginalExpression: "
+                    + re.sub(
+                        r"\s+",
+                        " ",
+                        str(source_value),
+                    )[:200]
+                )
+
+                write_value = self._pad_set_value(
+                    self._translate_expression(str(source_value))
+                )
+            else:
+                write_value = "$'''MANUAL_Fix'''"
+
+            if "MANUAL_Fix" in write_value:
+                self._add_manual_review(
+                    action=action,
+                    mapping=mapping,
+                    reason=(
+                        "Excel write value could not be translated"
+                    ),
+                    suggested_pad_action="Excel.WriteToExcel",
+                    source_data={"Value": source_value},
+                    required_work=(
+                        "Set the value written to Excel manually."
+                    ),
+                )
+
+            if parsed_range:
+                self._add_line(
+                    "Excel.WriteToExcel.WriteCell "
+                    f"Column: $'''{parsed_range['start_column']}''' "
+                    f"Instance: {instance_var} "
+                    f"Row: {parsed_range['start_row']} "
+                    f"Value: {write_value}"
+                )
+            else:
+                self._add_line(
+                    "Excel.WriteToExcel.Write "
+                    f"Instance: {instance_var} "
+                    f"Value: {write_value}"
+                )
+
+            return True
+
+        # ----------------------------------------------------------
+        # APPEND
+        # ----------------------------------------------------------
+        if action_type == "appendrange":
+            source_value = (
+                properties.get("DataTable")
+                or expressions.get("DataTable")
+                or ""
+            )
+
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "UiPath AppendRange has no single PAD equivalent; "
+                    "the first free row must be located before writing"
+                ),
+                suggested_pad_action=(
+                    "Excel.GetFirstFreeRowOnColumn then "
+                    "Excel.WriteToExcel.WriteCell"
+                ),
+                source_data={
+                    "DataTable": source_value,
+                    "SheetName": sheet_name,
+                },
+                required_work=(
+                    "Add Get first free row on column, then write the "
+                    "data at that row. Verify the output variable name "
+                    "of the first-free-row action in the designer."
+                ),
+            )
+
+            if source_value:
+                write_value = self._pad_set_value(
+                    self._translate_expression(str(source_value))
+                )
+            else:
+                write_value = "$'''MANUAL_Fix'''"
+
+            self._add_line(
+                "Excel.WriteToExcel.Write "
+                f"Instance: {instance_var} "
+                f"Value: {write_value}"
+            )
+            return True
+
+        # ----------------------------------------------------------
+        # SAVE
+        # ----------------------------------------------------------
+        if action_type in ("saveworkbook", "savedocument", "save"):
+            if "Excel.SaveExcel.Save" in self.pad_schema_index:
+                self._add_line(
+                    f"Excel.SaveExcel.Save Instance: {instance_var}"
+                )
+                return True
+
+        return False
             
     # ------------------------------------------------------------------
     # Standard action generators
@@ -1621,6 +2140,18 @@ class PADScriptGenerator:
                 inputs=inputs,
             )
 
+            # Excel child actions must reference the enclosing scope's
+            # instance rather than an empty placeholder variable.
+            if param_name.lower() == "instance":
+                active_instance = getattr(
+                    self,
+                    "_active_excel_instance",
+                    None,
+                )
+
+                if active_instance:
+                    resolved_value = active_instance
+
             if (
                 is_process_kill_action
                 and param_name.lower() in ("processid", "processname")
@@ -1958,7 +2489,8 @@ class PADScriptGenerator:
                     )
                     resolved_value = "$'''MANUAL_Fix'''"
 
-            filled_parts.append(f"{param_name}: {resolved_value}")
+                filled_parts.append(f"{param_name}: {resolved_value}")
+
         for output in outputs:
             out_name = output.get("Name", "")
             if isinstance(out_name, dict):
