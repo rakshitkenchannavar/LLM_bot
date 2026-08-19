@@ -212,9 +212,16 @@ class PADScriptGenerator:
             default_value = self._get_default_for_type(var_type, default)
             safe = self._safe_var(name)
 
-            source_type = var.get("type", "")
+            # Prefer the exact UiPath type over the simplified IR type so
+            # Dictionary(String, Object) and Double are not reduced to
+            # Text or Number.
+            source_type = (
+                var.get("source_type")
+                or var.get("type")
+                or ""
+            )
 
-            if source_type and source_type != "General":
+            if source_type and source_type not in ("General", "Object"):
                 self._add_line(
                     f"# Variable Type: {source_type}"
                 )
@@ -230,7 +237,21 @@ class PADScriptGenerator:
             arg_type = arg.get("type", "General")
             default_value = self._get_default_for_type(arg_type, default)
             direction = arg.get("direction", "In")
-            self._add_comment(f"Argument ({direction}): {name}")
+
+            arg_source_type = (
+                arg.get("source_type")
+                or arg.get("type")
+                or ""
+            )
+
+            if arg_source_type and arg_source_type not in (
+                "General",
+                "Object",
+            ):
+                self._add_line(
+                    f"# Argument ({direction}) Type: {arg_source_type}"
+                )
+
             self._add_line(f"SET {name} TO {default_value}")
             self.generated_variables.add(name)
 
@@ -2758,7 +2779,11 @@ class PADScriptGenerator:
         # never wrapped as %variables% by the identifier pass.
         expr = self._normalize_key_tokens(expr)
 
-        
+        expr = self._normalize_key_tokens(expr)
+
+        expr = re.sub(r'"([^"]*)"', _stash, expr)
+        expr = re.sub(r"'([^']*)'", _stash, expr)
+
         expr = re.sub(r'"([^"]*)"', _stash, expr)
         expr = re.sub(r"'([^']*)'", _stash, expr)
 
@@ -2842,8 +2867,16 @@ class PADScriptGenerator:
 
         def _wrap(match):
             word = match.group(1)
+
             if word.lower() in keywords:
                 return word
+
+            # Excel cell references (H35, AB12) are navigation literals,
+            # never variables. Wrapping them creates phantom %H35%
+            # references and forces an empty SET H35 declaration.
+            if re.fullmatch(r"[A-Z]{1,3}\d{1,7}", word):
+                return word
+
             return f"%{self._safe_var(word)}%"
 
         expr = re.sub(r'(?<![.\w%\x00])([A-Za-z_]\w*)(?![.\w(])', _wrap, expr)
@@ -2902,6 +2935,9 @@ class PADScriptGenerator:
                 if re.fullmatch(r"'[^']*'|\"[^\"]*\"", p):
                     out.append(p[1:-1])
                 elif re.fullmatch(r"%[A-Za-z_]\w*%", p):
+                    out.append(p)
+                elif re.fullmatch(r"[A-Z]{1,3}\d{1,7}", p):
+                    # Excel cell reference - literal text, not a variable.
                     out.append(p)
                 elif re.fullmatch(r"[A-Za-z_]\w*", p):
                     out.append(f"%{p}%")
@@ -3569,7 +3605,15 @@ class PADScriptGenerator:
             for m in re.finditer(r"%([A-Za-z_]\w*)%", line):
                 referenced.add(m.group(1))
 
-        missing = sorted(v for v in referenced if v not in self.generated_variables)
+        # Excel cell references are literals, not variables - declaring
+        # them creates phantom empty variables the developer must ignore.
+        missing = sorted(
+            v
+            for v in referenced
+            if v not in self.generated_variables
+            and not re.fullmatch(r"[A-Z]{1,3}\d{1,7}", v)
+        )
+
         if not missing:
             return
 

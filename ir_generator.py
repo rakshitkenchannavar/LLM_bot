@@ -244,9 +244,18 @@ class IRGenerator:
                 continue
             seen_names.add(name)
 
+            raw_type = (
+                var.get("source_type")
+                or var.get("type")
+                or "Object"
+            )
+
             normalized.append({
                 "name": name,
-                "type": self._map_variable_type(var.get("type", "Object")),
+                "type": self._map_variable_type(
+                    var.get("type", "Object")
+                ),
+                "source_type": raw_type,
                 "default_value": var.get("default_value", ""),
                 "scope": var.get("scope", "local"),
                 "direction": var.get("direction", "local"),
@@ -268,9 +277,18 @@ class IRGenerator:
                 continue
             seen_names.add(name)
 
+            raw_type = (
+                arg.get("source_type")
+                or arg.get("type")
+                or "String"
+            )
+
             normalized.append({
                 "name": name,
-                "type": self._map_variable_type(arg.get("type", "String")),
+                "type": self._map_variable_type(
+                    arg.get("type", "String")
+                ),
+                "source_type": raw_type,
                 "direction": arg.get("direction", "In"),
                 "default_value": arg.get("default_value", ""),
             })

@@ -288,6 +288,20 @@ class XAMLParser:
 
         var_type = self._simplify_type(var_type_raw)
 
+        # Keep the full UiPath type text so generic parameters such as
+        # Dictionary(String, Object) survive into the generated comment.
+        full_type = str(var_type_raw or "").strip()
+
+        if full_type:
+            full_type = re.sub(
+                r"clr-namespace:[^;]+;assembly=[^\s,)]+",
+                "",
+                full_type,
+            )
+            full_type = re.sub(r"\s+", " ", full_type).strip()
+            full_type = full_type.replace("x:", "").replace("s:", "")
+            full_type = full_type.replace("scg:", "")
+
         default_value = var_elem.get("Default", "")
 
         # Check for default value in child element
@@ -301,6 +315,7 @@ class XAMLParser:
         return {
             "name": name,
             "type": var_type,
+            "source_type": full_type or var_type,
             "default_value": default_value,
             "scope": "local",
         }
@@ -348,10 +363,32 @@ class XAMLParser:
 
         arg_type = self._simplify_type(arg_type_raw)
 
+        # Strip the InArgument/OutArgument wrapper to expose the real type.
+        full_type = str(arg_type_raw or "").strip()
+
+        wrapper_match = re.match(
+            r"(?:In|Out|InOut)Argument\((.+)\)\s*$",
+            full_type,
+        )
+
+        if wrapper_match:
+            full_type = wrapper_match.group(1).strip()
+
+        if full_type:
+            full_type = re.sub(
+                r"clr-namespace:[^;]+;assembly=[^\s,)]+",
+                "",
+                full_type,
+            )
+            full_type = re.sub(r"\s+", " ", full_type).strip()
+            full_type = full_type.replace("x:", "").replace("s:", "")
+            full_type = full_type.replace("scg:", "")
+
         return {
             "name": name,
             "direction": direction,
             "type": arg_type,
+            "source_type": full_type or arg_type,
             "default_value": arg_elem.get("Default", ""),
         }
 
