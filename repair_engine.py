@@ -310,7 +310,25 @@ class RepairEngine:
 
         invalid_out = out_match.group(1)
 
-        # Remove the invalid output: Pattern=> Variable
+        # Never delete an output capture. Removing "Instance=> Var" or
+        # "ExcelData=> Var" silently breaks the runtime handle that every
+        # downstream action depends on.
+        protected_outputs = {
+            "Instance",
+            "ExcelData",
+            "CellValue",
+            "BrowserInstance",
+            "Result",
+        }
+
+        if invalid_out in protected_outputs:
+            logger.warning(
+                "Refusing to remove output capture '%s=>' - it carries a "
+                "runtime handle the flow depends on",
+                invalid_out,
+            )
+            return None
+
         pattern = rf'\s*{re.escape(invalid_out)}=>\s*\S+'
         cleaned = re.sub(pattern, '', original_line)
 
@@ -383,19 +401,32 @@ class RepairEngine:
 
         return self._repair_with_llm(lines, error)
 
-    def _repair_invalid_block(self, lines, error, ir_data=None, mapping_result=None):
-        """Fix block structure errors (IF/END/LOOP mismatch).
+    def _repair_invalid_block(
+        self,
+        lines,
+        error,
+        ir_data=None,
+        mapping_result=None,
+    ):
+        """Repair safe block-balance problems only.
 
-        Strategy:
-        1. Count block openers and closers
-        2. Add missing END statements
-        3. Remove orphan END statements
+        Duplicate ON BLOCK ERROR declarations cannot safely be repaired by
+        changing one line because the surrounding END ownership would also need
+        to be reconstructed. The generator must prevent those structures.
         """
-        line_num = error.get("line", 0)
-        if line_num <= 0:
-            return self._fix_all_block_structures(lines)
+        message = (error.get("message") or "").lower()
 
-        idx = line_num - 1
+        if (
+            "error block statement was previously defined" in message
+            or "block statement was previously defined" in message
+        ):
+            logger.warning(
+                "Duplicate ON BLOCK ERROR detected. Skipping unsafe "
+                "line-level repair; regenerate using the corrected "
+                "PADScriptGenerator._generate_try_catch()."
+            )
+            return None
+
         return self._fix_all_block_structures(lines)
 
     def _repair_variable_not_defined(self, lines, error, ir_data=None, mapping_result=None):

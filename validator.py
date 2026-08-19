@@ -120,10 +120,11 @@ def validate_robin_semantics(script_path, schema_path=None):
 
         schema = schema_map[action_id]
         valid_inputs = {inp["Name"] for inp in schema.get("Inputs", [])}
-        valid_outputs = set()
-        for out in schema.get("Outputs", []) or []:
-            valid_outputs.add(out.get("Name", "") if isinstance(out, dict) else out)
 
+        declared_outputs = schema.get("Outputs", []) or []
+        valid_outputs = set()
+        for out in declared_outputs:
+            valid_outputs.add(out.get("Name", "") if isinstance(out, dict) else out)
         clean_line = strip_strings(orig_line)
 
         inputs_used = re.findall(r"(?:^|\s)([A-Za-z0-9_]+):", clean_line)
@@ -136,14 +137,29 @@ def validate_robin_semantics(script_path, schema_path=None):
                     "startLine": line_num, "startColumn": 0,
                 })
 
-        outputs_used = re.findall(r"(?:^|\s)([A-Za-z0-9_]+)=>", clean_line)
-        for out in outputs_used:
-            if out not in valid_outputs:
-                errors.append({
-                    "message": f"Unknown argument(s): '{out}' (Output).",
-                    "text": None, "stopLine": line_num, "stopColumn": 0,
-                    "startLine": line_num, "startColumn": 0,
-                })
+        # Output validation only applies when the schema actually records
+        # outputs. Every Excel action has an empty Outputs list even though
+        # the PAD designer emits captures like "Instance=> Var" - flagging
+        # those produces false errors and can trigger a repair that deletes
+        # the capture.
+        if declared_outputs:
+            outputs_used = re.findall(
+                r"(?:^|\s)([A-Za-z0-9_]+)=>",
+                clean_line,
+            )
+
+            for out in outputs_used:
+                if out not in valid_outputs:
+                    errors.append({
+                        "message": (
+                            f"Unknown argument(s): '{out}' (Output)."
+                        ),
+                        "text": None,
+                        "stopLine": line_num,
+                        "stopColumn": 0,
+                        "startLine": line_num,
+                        "startColumn": 0,
+                    })
 
     return {"errors": errors, "isValid": len(errors) == 0}
 # ================================================================
@@ -398,7 +414,21 @@ class Validator:
     @staticmethod
     def _determine_error_type(message):
         """Determine error type from message content."""
-        msg_lower = message.lower()
+        msg_lower = (message or "").lower()
+
+        # Specific PAD block errors must be detected before generic syntax
+        # classification.
+        if (
+            "error block statement was previously defined" in msg_lower
+            or "block statement was previously defined" in msg_lower
+            or "invalid block" in msg_lower
+            or "block structure" in msg_lower
+            or (
+                "block" in msg_lower
+                and "previously defined" in msg_lower
+            )
+        ):
+            return "invalid_block"
 
         if "wasn't found" in msg_lower or "not found" in msg_lower:
             if "module" in msg_lower or "action" in msg_lower:
@@ -409,23 +439,35 @@ class Validator:
                 return "unknown_output"
             return "unknown_argument"
 
-        if "syntax" in msg_lower or "unexpected" in msg_lower or "expected" in msg_lower:
-            return "syntax_error"
-
-        if "required" in msg_lower or "missing" in msg_lower:
-            return "missing_required"
-
-        if "expression" in msg_lower or "invalid" in msg_lower:
-            return "invalid_expression"
-
-        if "block" in msg_lower or ("end" in msg_lower and "mismatch" in msg_lower):
-            return "invalid_block"
-
-        if "variable" in msg_lower and ("not" in msg_lower or "undefined" in msg_lower):
+        if "variable" in msg_lower and (
+            "not defined" in msg_lower
+            or "undefined" in msg_lower
+            or "does not exist" in msg_lower
+        ):
             return "variable_not_defined"
 
         if "type" in msg_lower and "mismatch" in msg_lower:
             return "type_mismatch"
+
+        if "required" in msg_lower or "missing parameter" in msg_lower:
+            return "missing_required"
+
+        if (
+            "block" in msg_lower
+            or "end mismatch" in msg_lower
+            or "unexpected end" in msg_lower
+        ):
+            return "invalid_block"
+
+        if "expression" in msg_lower or "invalid expression" in msg_lower:
+            return "invalid_expression"
+
+        if (
+            "syntax" in msg_lower
+            or "unexpected" in msg_lower
+            or "expected" in msg_lower
+        ):
+            return "syntax_error"
 
         return "syntax_error"
 
