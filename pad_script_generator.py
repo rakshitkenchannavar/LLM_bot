@@ -784,122 +784,119 @@ class PADScriptGenerator:
         # Guarantee the caller sees the same indent it started with.
         self.indent_level = entry_indent
                 
-    def _generate_block(self, action, mapping, mapping_lookup, all_actions):
-        """Generate structured UiPath containers including Flowcharts, State Machines, and Parallel Blocks."""
+    def _generate_block(
+        self,
+        action,
+        mapping,
+        mapping_lookup,
+        all_actions,
+    ):
+        """Generate structural UiPath containers.
+
+        Structural blocks do not emit unsupported Robin actions. Their
+        children are preserved in source execution order.
+        """
         target_action = mapping.get("target_action", "BLOCK:Unknown")
         block_type = target_action.replace("BLOCK:", "", 1)
-        display_name = action.get("display_name") or action.get("action_type") or block_type
+        display_name = (
+            action.get("display_name")
+            or action.get("action_type")
+            or block_type
+        )
 
-        # 1. State Machine Execution Route
-        if block_type == "StateMachine" or action.get("action_type") == "StateMachine":
-            self._generate_state_machine_routing(action, mapping_lookup, all_actions)
-            return
-
-        # 2. Parallel Container Execution Route
-        if action.get("action_type") == "Parallel":
-            self._generate_parallel_serialization(action, mapping_lookup, all_actions)
-            return
-
-        # 3. Flowchart: Visual execution tracing
-        if block_type == "Flowchart":
-            self._add_line(f"# --- Visual Flowchart: {display_name} Execution Tracing ---")
-            self._generate_children(action, mapping_lookup, all_actions)
-            return
-
-        # Simple structural node blocks (States, Transitions, FlowSteps, Sequences)
-        if block_type == "State":
-            self._add_line("")
-            self._add_line(f"# ===== STATE: {display_name} =====")
-            self._generate_children(action, mapping_lookup, all_actions)
-            return
-
-        if block_type == "Transition":
-            properties = action.get("properties", {}) or {}
-            expressions = action.get("expressions", {}) or {}
-            condition = properties.get("Condition") or expressions.get("Condition") or ""
-            translated_condition = self._translate_expression(condition) if condition else "always"
-            
-            self._add_line(f"# Transition Condition: {translated_condition}")
-            self._generate_children(action, mapping_lookup, all_actions)
-            return
-
-        self._generate_children(action, mapping_lookup, all_actions)
-
-    def _generate_state_machine_routing(self, action, mapping_lookup, all_actions):
-        """Implement cyclic State Machine logical routing loop inside PAD using valid loop/switch syntax."""
-        display_name = action.get("display_name", "Process State Machine")
-        properties = action.get("properties", {}) or {}
-        initial_state = properties.get("InitialState", "State_Init")
-
-        # Sanitize single quotes and convert any potential HTML leaks
-        initial_state = str(initial_state).replace("'", "").replace('"', "").strip()
-        state_var = f"CurrentState_{action.get('action_id')}"
-        self._ensure_variable(state_var)
-
-        # Safety Check: If the state machine has no child states, bypass empty generation
-        child_ids = action.get("child_ids", [])
-        if not child_ids:
+        if block_type == "StateMachine":
             self._add_manual_review(
                 action=action,
-                reason="StateMachine contains no resolvable child states or transitions",
-                suggested_pad_action="COMMENT",
-                required_work="Verify StateMachine transition routing manually."
+                mapping=mapping,
+                reason=(
+                    "PAD has no state-machine container; states were "
+                    "flattened into sequential execution"
+                ),
+                suggested_pad_action=(
+                    "Loop with CurrentState variable and If branches"
+                ),
+                required_work=(
+                    "Re-wire states as a CurrentState loop. States "
+                    "currently run sequentially, which is NOT the "
+                    "source behavior."
+                ),
+            )
+            self._generate_children(
+                action,
+                mapping_lookup,
+                all_actions,
             )
             return
 
-        self._add_line(f"# === BEGIN STATE MACHINE: {display_name} ===")
-        self._add_line(f"SET {state_var} TO $'''{initial_state}'''")
-        
-        # CORRECT ROBIN SYNTAX: LOOP followed directly by the comparison (no WHILE keyword)
-        self._add_line(f"LOOP %{state_var}% <> $'''EndState'''")
-        self.indent_level += 1
-        
-        self._add_line(f"SWITCH %{state_var}%")
-        self.indent_level += 1
+        if block_type == "State":
+            self._add_line("")
+            self._add_comment(
+                f"===== STATE: {display_name} ====="
+            )
+            self._generate_children(
+                action,
+                mapping_lookup,
+                all_actions,
+            )
+            return
 
-        # Generate each Case routing branch dynamically
-        for child_id in child_ids:
-            child_state = self._get_action_by_id(child_id, all_actions)
-            if not child_state:
-                continue
-                
-            state_name = str(child_state.get("display_name", "State")).replace("'", "").strip()
-            self._add_line(f"CASE $'''{state_name}'''")
-            self.indent_level += 1
-            
-            # Generate state actions
-            self._generate_action(child_state, mapping_lookup, all_actions)
-            
-            # Safety exit routing
-            self._add_line(f"SET {state_var} TO $'''EndState'''")
-            
-            self.indent_level -= 1
+        if block_type == "Transition":
+            properties = action.get("properties", {})
+            expressions = action.get("expressions", {})
 
-        self.indent_level -= 1
-        self._add_line("END") # Switch block
-        
-        self.indent_level -= 1
-        self._add_line("END") # Loop block
-        
-        # Enforce distinct line entry to prevent inline comment concatenation
-        self._add_line(f"# === END STATE MACHINE: {display_name} ===")
+            condition = (
+                properties.get("Condition")
+                or expressions.get("Condition")
+                or expressions.get("expression_0")
+                or ""
+            )
 
-    def _generate_parallel_serialization(self, action, mapping_lookup, all_actions):
-        """Serialize parallel execution lanes sequentially with structural alerts."""
-        display_name = action.get("display_name", "Parallel execution")
-        
-        self._add_line("# " + "=" * 60)
-        self._add_line(f"# WARNING: Parallel block '{display_name}' detected.")
-        self._add_line("# PAD Visual flows do not support concurrent multi-threading.")
-        self._add_line("# Visual branches have been serialized sequentially.")
-        self._add_line("# " + "=" * 60)
+            if condition:
+                translated_condition = self._translate_expression(
+                    condition
+                )
+            else:
+                translated_condition = "always"
 
-        child_ids = action.get("child_ids", [])
-        for branch_idx, child_id in enumerate(child_ids):
-            child = self._get_action_by_id(child_id, all_actions)
-            if child:
-                self._add_line(f"# --- Concurrent Branch Segment {branch_idx + 1} ---")
-                self._generate_action(child, mapping_lookup, all_actions)
+            self._add_manual_review(
+                action=action,
+                mapping=mapping,
+                reason=(
+                    "State transition requires manual state-variable "
+                    "routing"
+                ),
+                suggested_pad_action="If condition plus Set CurrentState",
+                source_data={
+                    "Condition": condition or "unconditional",
+                    "TranslatedCondition": translated_condition,
+                },
+                required_work=(
+                    "Set CurrentState to the target state when this "
+                    "condition is true."
+                ),
+            )
+            self._generate_children(
+                action,
+                mapping_lookup,
+                all_actions,
+            )
+            return
+
+        if block_type == "FlowStep":
+            self._generate_children(
+                action,
+                mapping_lookup,
+                all_actions,
+            )
+            return
+
+        # Sequence, Flowchart, Then, Else, Body, Action, Container,
+        # Subflow and other structural wrappers are passthrough blocks.
+        self._generate_children(
+            action,
+            mapping_lookup,
+            all_actions,
+        )
             
     def _extract_file_log_message(self, action):
         """Extract the original UiPath LogMessage or WriteLine content."""

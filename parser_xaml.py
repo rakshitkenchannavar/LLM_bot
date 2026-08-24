@@ -186,17 +186,12 @@ class XAMLParser:
         self.variables = []
         self.arguments = []
 
-        import html
         try:
-            # Read and decode HTML characters first to prevent entity corruption (e.g. &#39; -> ')
-            with open(xaml_path, "r", encoding="utf-8", errors="ignore") as f:
-                raw_content = f.read()
-            sanitized_content = html.unescape(raw_content)
-            
-            # Parse the sanitized XAML content
+            # recover=True tolerates invalid namespace URIs (e.g., clr-namespace
+            # with full assembly-qualified names containing spaces/commas)
             xml_parser = etree.XMLParser(recover=True)
-            root = etree.fromstring(sanitized_content.encode("utf-8"), parser=xml_parser)
-            
+            tree = etree.parse(str(xaml_path), xml_parser)
+            root = tree.getroot()
         except etree.XMLSyntaxError as e:
             raise ValueError(f"Invalid XAML syntax in {xaml_path}: {e}")
 
@@ -475,13 +470,8 @@ class XAMLParser:
             "children": [],
         }
 
-        # Parse children based on container type to preserve visual execution order
-        if activity_type == "Flowchart":
-            node["children"] = self._parse_flowchart_graph(element, action_id)
-        elif activity_type == "StateMachine":
-            node["children"] = self._parse_state_machine_graph(element, action_id)
-        else:
-            node["children"] = self._parse_children(element, action_id, 0)
+        # Parse children
+        node["children"] = self._parse_children(element, action_id, 0)
 
         return node
 
@@ -560,104 +550,6 @@ class XAMLParser:
                 results.extend(inner_children)
 
         return results
-    
-    def _parse_flowchart_graph(self, element, parent_id):
-        """Trace flowchart execution flow following graph references (Next, True, False).
-        
-        This overrides simple sequential sibling traversal, guaranteeing execution
-        order matches visual connections.
-        """
-        nodes_by_ref = {}
-        start_node_ref = None
-
-        # 1. Map all visual flowchart nodes by their internal reference ID
-        for child in element.iter():
-            ref_name = child.get(f"{{{NAMESPACES['x']}}}Name") or child.get("Name")
-            if ref_name:
-                nodes_by_ref[ref_name] = child
-
-        # 2. Locate flowchart start node
-        for child in element:
-            tag = self._clean_tag(child.tag)
-            if "StartNode" in tag or tag.endswith(".StartNode"):
-                for start_child in child:
-                    start_node_ref = start_child.get("Ref") or start_child.get(f"{{{NAMESPACES['x']}}}Key")
-                    if not start_node_ref and len(start_child) > 0:
-                        # Direct embedded element
-                        parsed_start = self._parse_element(start_child, parent_id, 0)
-                        if parsed_start:
-                            return [parsed_start]
-
-        if not start_node_ref and nodes_by_ref:
-            # Fallback to first visual key
-            start_node_ref = list(nodes_by_ref.keys())[0]
-
-        # 3. Traverse the execution graph following execution connections
-        visited = set()
-        execution_sequence = []
-        current_ref = start_node_ref
-        order = 0
-
-        while current_ref and current_ref not in visited:
-            visited.add(current_ref)
-            node = nodes_by_ref.get(current_ref)
-            if node is None:
-                break
-
-            parsed_node = self._parse_element(node, parent_id, order)
-            if parsed_node:
-                execution_sequence.append(parsed_node)
-                order += 1
-
-            # Resolve next execution steps (edges)
-            next_ref = None
-            for edge in node:
-                edge_tag = self._clean_tag(edge.tag)
-                if edge_tag.endswith(".Next") or edge_tag == "Next":
-                    next_ref = edge.get("Ref") or (edge[0].get("Ref") if len(edge) > 0 else None)
-                elif edge_tag.endswith(".True") or edge_tag == "True":
-                    next_ref = edge.get("Ref")
-                elif edge_tag.endswith(".False") or edge_tag == "False":
-                    next_ref = edge.get("Ref")
-
-            current_ref = next_ref
-
-        # Fallback to simple traversal if graph tracing produced no execution sequence
-        if not execution_sequence:
-            return self._parse_children(element, parent_id, 0)
-
-        return execution_sequence
-
-    def _parse_state_machine_graph(self, element, parent_id):
-        """Extract states and their transition mappings from a StateMachine container."""
-        states = []
-        initial_state_ref = None
-        
-        # Parse states and extract visual transitions
-        for child in element:
-            tag = self._clean_tag(child.tag)
-            if tag == "State":
-                state_node = self._parse_element(child, parent_id, len(states))
-                if state_node:
-                    states.append(state_node)
-            elif "InitialState" in tag or tag.endswith(".InitialState"):
-                for init_child in child:
-                    initial_state_ref = init_child.get("Ref")
-
-        # Package the state-machine metadata cleanly for the script generator
-        state_machine_container = {
-            "action_id": f"sm_{self.action_counter:04d}",
-            "parent_id": parent_id,
-            "order": 0,
-            "action_type": "StateMachine",
-            "display_name": element.get("DisplayName", "Process State Machine"),
-            "container_type": "StateMachine",
-            "properties": {
-                "InitialState": initial_state_ref or (states[0]["action_id"] if states else ""),
-            },
-            "children": states,
-        }
-        return [state_machine_container]
 
     # ------------------------------------------------------------------
     # Property extraction
