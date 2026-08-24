@@ -826,29 +826,44 @@ class PADScriptGenerator:
         self._generate_children(action, mapping_lookup, all_actions)
 
     def _generate_state_machine_routing(self, action, mapping_lookup, all_actions):
-        """Implement cyclic State Machine logical routing loop inside PAD using Switch."""
+        """Implement cyclic State Machine logical routing loop inside PAD using valid loop/switch syntax."""
         display_name = action.get("display_name", "Process State Machine")
         properties = action.get("properties", {}) or {}
         initial_state = properties.get("InitialState", "State_Init")
 
+        # Sanitize single quotes and convert any potential HTML leaks
+        initial_state = str(initial_state).replace("'", "").replace('"', "").strip()
         state_var = f"CurrentState_{action.get('action_id')}"
         self._ensure_variable(state_var)
 
+        # Safety Check: If the state machine has no child states, bypass empty generation
+        child_ids = action.get("child_ids", [])
+        if not child_ids:
+            self._add_manual_review(
+                action=action,
+                reason="StateMachine contains no resolvable child states or transitions",
+                suggested_pad_action="COMMENT",
+                required_work="Verify StateMachine transition routing manually."
+            )
+            return
+
         self._add_line(f"# === BEGIN STATE MACHINE: {display_name} ===")
         self._add_line(f"SET {state_var} TO $'''{initial_state}'''")
-        self._add_line(f"LOOP WHILE {state_var} <> $'''EndState'''")
+        
+        # CORRECT ROBIN SYNTAX: LOOP followed directly by the comparison (no WHILE keyword)
+        self._add_line(f"LOOP %{state_var}% <> $'''EndState'''")
         self.indent_level += 1
         
         self._add_line(f"SWITCH %{state_var}%")
         self.indent_level += 1
 
         # Generate each Case routing branch dynamically
-        for child_id in action.get("child_ids", []):
+        for child_id in child_ids:
             child_state = self._get_action_by_id(child_id, all_actions)
             if not child_state:
                 continue
                 
-            state_name = child_state.get("display_name", "State")
+            state_name = str(child_state.get("display_name", "State")).replace("'", "").strip()
             self._add_line(f"CASE $'''{state_name}'''")
             self.indent_level += 1
             
@@ -865,6 +880,8 @@ class PADScriptGenerator:
         
         self.indent_level -= 1
         self._add_line("END") # Loop block
+        
+        # Enforce distinct line entry to prevent inline comment concatenation
         self._add_line(f"# === END STATE MACHINE: {display_name} ===")
 
     def _generate_parallel_serialization(self, action, mapping_lookup, all_actions):

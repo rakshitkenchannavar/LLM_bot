@@ -186,12 +186,17 @@ class XAMLParser:
         self.variables = []
         self.arguments = []
 
+        import html
         try:
-            # recover=True tolerates invalid namespace URIs (e.g., clr-namespace
-            # with full assembly-qualified names containing spaces/commas)
+            # Read and decode HTML characters first to prevent entity corruption (e.g. &#39; -> ')
+            with open(xaml_path, "r", encoding="utf-8", errors="ignore") as f:
+                raw_content = f.read()
+            sanitized_content = html.unescape(raw_content)
+            
+            # Parse the sanitized XAML content
             xml_parser = etree.XMLParser(recover=True)
-            tree = etree.parse(str(xaml_path), xml_parser)
-            root = tree.getroot()
+            root = etree.fromstring(sanitized_content.encode("utf-8"), parser=xml_parser)
+            
         except etree.XMLSyntaxError as e:
             raise ValueError(f"Invalid XAML syntax in {xaml_path}: {e}")
 
